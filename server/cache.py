@@ -1,0 +1,919 @@
+"""The download cache's size cap: last use per file, LRU eviction, "clear cache" (docs/ROADMAP.md
+"Caching" 1, the cheap parts of 3 and 5).
+
+Layout of the cache root (~/.cache/beamng-earth by default):
+  VERSION             the layout version (LAYOUT_VERSION). Missing: this layout, written now. Any other
+                      value (a newer server's layout): the cache is left alone - counted, never evicted,
+                      cleared or indexed.
+  index.tsv           the last use of every tracked file ("<unix s>\t<bytes>\t<path>"), saved by the
+                      background thread every SAVE_S when something changed, and on close()
+  dem/ imagery/ colormatch/ deshadow/     MANAGED: tracked, evicted, cleared
+  mapdata/            MANAGED too (mapdata.py: layer files and the sources' range blocks; a missing
+                      one is a miss, built or fetched again). Not used by earthd yet, so nothing
+                      there is protected as this session's: the walk's mtime is its last use
+  gravity/            counted, never evicted or cleared (the 145 MB EGM2008 model, downloaded once)
+  airports/           the same (airports.py: OurAirports' CSV files, ~17 MB, the last good copy kept for
+                      offline use; airports.py replaces it weekly and deletes the old generation itself)
+  revisit/ seacarve/ peercache/ roadwidth/   MANAGED as well (since 2026-11-03), besides their own limits
+                      (revisit's, seacarve.RAW_MB, peerwork.CACHE_BYTES, roadwidth.STORE_MB, cut back at server start)
+  blocks/             MANAGED too (blockcache.py: the graded terrain blocks' chunks and entries), besides its own
+                      limit (blockcache.budget_mb: a share of this cap, cut back at start and by the writers)
+  mapdata-mirror/     counted and cleared (MIRRORED), not evicted file by file: pruned whole by mapdata (MIRROR_MB)
+  netstats/ (and anything else)           not tracked: the daily request budgets must survive a clear
+
+Last use = the server's own record of every disk hit and write (dem.py, imagery.py, the de-shadow and
+colour-seam caches call used() / wrote() / read()), not the file system's atime (relatime) and no stat
+per request: one dict update under a lock. At start a background thread walks the tree once
+(st_size, and st_mtime = the download time for files the index does not know, e.g. a cache from before
+this module) and merges it with the index; until then ready is False and nothing is evicted.
+
+Eviction (a background thread): when the tracked bytes exceed the cap, least recently used files go
+until LOW_WATER (90 %) of the cap is left, at most every EVICT_S; the raw elevation tiles (KEEP_PREFIXES) are passed over
+while they are at most KEEP_SHARE of that (dear to download again, small beside the rest). Never evicted: gravity/, files this
+server process used within PROTECT_S (an hour: the area around the player), and markers (_marker: empty files such
+as "no seams", and the tile columns' miss indexes, missindex.py: they save requests; clear() removes them).
+The start-up walk also hands the old per-tile 404 marker files (<y>.404) to missindex (migrate_misses, a thread of
+its own) and deletes what a clear_all moved into _trash/ (the launcher's --clear-cache: a rename, deleted later).
+Directories stay (a writer may be about to put a file there). clear() removes every MANAGED file but the ones this server process used at all
+(the current session's, however long ago). Neither touches a file in a saved area (pinned(keys): areas.py,
+the map's downloads ahead).
+
+on_change(key, added): a key new to the index or gone from it (the map's cache view, covermap.py); never called
+for a repeat hit.
+
+Per-source lifetimes (ROADMAP "Caching" 3): LIFETIMES maps a path prefix to the longest a file may be
+kept after its download (s); the start-up walk deletes older ones. Empty today: none of the current
+sources (USGS public domain, EOX CC BY / CC BY-NC-SA, Mapterhorn, AWS Terrain Tiles) limits caching
+time; the 404 markers' own expiry is netfetch's miss_ttl. Per-producer versions live in the paths
+(colormatch/v1/, imagery/usgs-ds1-<mode>/): a generator update writes a new directory and the old one
+is never read again, so it ages out through the LRU instead of being deleted at once (ROADMAP 5).
+
+Memory: about 200 bytes per tracked file (a 20 GB cache of 30 KB imagery tiles: ~130 MB).
+"""
+import logging
+import math
+import os
+import ioprofiler
+import missindex
+import shutil
+import threading
+import time
+
+log = logging.getLogger("earthd.cache")
+
+LAYOUT_VERSION = 1
+VERSION_FILE = "VERSION"
+INDEX_FILE = "index.tsv"
+# The start-up walk waits this long after the server starts and yields the interpreter every WALK_YIELD_N files: it
+# only readies eviction, and over a 672k-file cache it was ~19 CPU-s in the server's process during the first place's
+# loading (py-spy, a cold teleport 2026-11-11), beside the far textures and plans that share the interpreter
+WALK_DELAY_S = float(os.environ.get("BNGE_CACHE_WALK_DELAY_S", "90"))
+WALK_YIELD_N = 500
+INDEX_HEADER = "# beamng-earth cache index 1"
+# evicted and cleared. The app's built caches too (2026-11-03, a player's cache 25 GB under a 20 GB cap: they were
+# left out of the count and of "Clear cache"): a missing file of theirs is a miss, made again; their own limits stay
+MANAGED = ("dem", "imagery", "colormatch", "deshadow", "mapdata", "revisit", "seacarve", "roadwidth", "peercache",
+           "raw", "plans", "roadz", "vegetation", "pagesdata", "decoded", "mapterhorn", "blocks", "decisions",
+           "lidarz")
+CLEAR_KEEP_S = 600.0        # "Clear cache" keeps the files used this recently (the place around the player now)
+# Downloads that are dear to fetch again and small beside what is made from them: the elevation tiles (Mapterhorn: one
+# maintainer on donations, 53 M requests a day from players, 2026-11-11). A cold place's are ~160 MB of its ~2.8 GB in
+# the cache (the decoded mirror, revisit, map data, sea floor, photos), so plain least-recently-used eviction under the
+# 20 GB default cap dropped them after ~7 other places and a return downloaded every one again. Eviction now passes
+# over them while they are at most KEEP_SHARE of what it cuts down to (their own oldest go first beyond that).
+KEEP_PREFIXES = ("dem/mapterhorn/", "dem/aws-terrarium/")
+KEEP_SHARE = 0.25
+MIRRORED = ("mapdata-mirror",)      # counted and cleared, never evicted file by file (a cell's files and its "ok" go
+                                    # together: mapdata prunes it whole, MIRROR_MB)
+KEPT = ("gravity", "airports")                              # counted only
+DEFAULT_CAP_GB = 20.0
+MAX_CAP_GB = 1e6            # 1 PB: anything above is a mistake (and would overflow)
+GB = 1e9                    # the page's GB (decimal, as disk sizes are sold)
+LOW_WATER = 0.9             # evict down to this share of the cap
+PROTECT_S = 3600.0          # used by this server within an hour: never evicted (clear: any use this session)
+EVICT_S = 180.0             # at most one eviction pass per 3 minutes
+SAVE_S = 600.0              # index saved at most every 10 minutes (and on close)
+TICK_S = 30.0               # the background thread's check interval
+# The disk the cache is on keeps this much free whatever the cap (a cap, or "unlimited", larger than the disk's free
+# space filled players' disks: the first week's telemetry had ~19k "No space left on device" errors (OSError 28),
+# most at the far tiles): 5 % of the disk, at least DISK_RESERVE_MIN and at most DISK_RESERVE_MAX
+DISK_RESERVE_SHARE = 0.05
+DISK_CHECK_S = 10.0         # s between disk_short's questions to the disk (a busy hard disk answers in seconds)
+DISK_RESERVE_MIN = 2 * 1e9
+DISK_RESERVE_MAX = 10 * 1e9
+DISK_MARGIN = 1e9           # ... and a disk short of it is cut back this much further (not a file at a time)
+LIFETIMES = {}              # path prefix ("imagery/xyz/") -> max age after download (s); none today
+MISS_TOPS = ("dem", "imagery")      # their source folders get missindex.MIGRATED after the start-up migration
+MSG_VERSION = 1
+READ_WAITS = (0.02, 0.05, 0.1, 0.25)   # s between the tries of a read held up on Windows (NoCache.read)
+
+
+def _marker(key, size):
+    """A file that only saves requests: an empty marker ("no seams") or a column's miss index (missindex.NAME). Never
+    evicted (it frees next to nothing and the requests it saves are slow ones); "Clear cache" removes it."""
+    return size == 0 or key.endswith("/" + missindex.NAME)
+
+
+def cap_bytes(gb):
+    """A cap in GB (float, 0 = unlimited) as bytes; None / negative / not finite -> ValueError."""
+    gb = float(gb)
+    if not 0 <= gb <= MAX_CAP_GB:
+        raise ValueError(f"cache cap {gb!r} GB: a number from 0 to {MAX_CAP_GB:g} (0 = unlimited)")
+    return int(round(gb * GB))
+
+
+class NoCache:
+    """The default of every producer's `disk` attribute: reads and writes without bookkeeping (Server()
+    without a Cache, the tools, the tests)."""
+
+    @ioprofiler.disk_read
+    def read(self, path):
+        """The file's bytes, or None if it is not there (also when it was evicted a moment ago). On Windows a file
+        another process is replacing or deleting cannot be opened for a moment (PermissionError: a far tile of a
+        first visit to Chicago failed on a Windows test PC, 2026-10-24): tried again READ_WAITS, then a miss (the
+        caller fetches it again and staging.replace_cached keeps whichever copy goes in)."""
+        for wait in READ_WAITS + (None,):
+            try:
+                with open(path, "rb") as f:
+                    return f.read()
+            except FileNotFoundError:
+                return None
+            except PermissionError:
+                if wait is None:
+                    log.debug("cache: %s held by another process: a miss", path)
+                    return None
+                time.sleep(wait)
+
+    def used(self, path, size=None):
+        pass
+
+    def wrote(self, path, size=None):
+        ioprofiler.monitor.record_write(size)
+
+    def forget(self, path):
+        pass
+
+
+NONE = NoCache()
+
+
+def _inside(path, root):
+    """Is path's real location (links resolved) inside root's?"""
+    try:
+        r = os.path.realpath(root)
+        return os.path.commonpath([os.path.realpath(path), r]) == r
+    except ValueError:              # (another drive on Windows)
+        return False
+
+
+class Cache(NoCache):
+    """Bookkeeping, cap and eviction for one cache root. used() / wrote() / read() are thread-safe and
+    cheap (any producer thread); evict(), clear() and save() take a while (the background thread, or
+    an executor for clear)."""
+
+    def __init__(self, root, cap_gb=None, now=time.time, start=True):
+        """cap_gb: the cap (GB, 0 = unlimited); None = the cap saved in the index (the last one the mod
+        set), else DEFAULT_CAP_GB. start: run the walk and the eviction thread (False: the caller calls
+        scan() / tick() itself, the tests)."""
+        self.root = os.path.abspath(root)
+        self._prefix = self.root + os.sep
+        self.now = now
+        self.started = now()
+        self._lock = threading.Lock()
+        self._entries = {}          # "dem/mapterhorn/12/1/2.webp" -> [bytes or None (not known yet), last use s]
+        self._used = 0              # bytes of the entries with a known size
+        self._cap = None            # bytes, 0 = unlimited (set below)
+        self.disk_usage = shutil.disk_usage     # (tests: a stand-in)
+        self._disk_short, self._disk_at, self._disk_busy = 0, -float("inf"), False     # (disk_short's last answer)
+        self._disk_warned = False
+        self._dirty = False
+        self.ready = False          # the start-up walk is done
+        self._walk_now = threading.Event()      # the start-up walk wanted now (walk_soon), not after WALK_DELAY_S
+        self._ready_ev = threading.Event()
+        self._last_evict = None
+        self._last_save = self.started
+        self._wake = threading.Event()
+        self._closed = False
+        self.stats = {"evicted": 0, "evicted_bytes": 0, "cleared": 0, "cleared_bytes": 0, "expired": 0}
+        self.legacy_misses = {}     # the start-up walk's old 404 marker files: folder -> [(y, mtime)]
+        # on_change(key, added): a key new to the index or gone from it (never a repeat hit), called under the lock
+        # (the map's cache view, covermap.py: it only queues the key). Set after the start-up walk.
+        self.on_change = None
+        # pinned(keys) -> [bool]: keys in a saved area (areas.py), skipped by evict() and clear(); pinned_bytes: their
+        # size for the settings page (areas.py counts it now and then), None without saved areas
+        self.pinned = None
+        self.pinned_bytes = None
+        self.managed = self._check_version()
+        # a cache whose tracked folders are links into another one is never ours to trim: a benchmark's scratch
+        # cache of links into the real one (its index left out, so the default cap) evicted ~7 GB of the real
+        # cache's files through them, 2026-10-29. Read-only use is fine; eviction, clear and expiry stay off
+        linked = [top for top in MANAGED + KEPT if os.path.islink(os.path.join(self.root, top))]
+        if linked and self.managed:
+            log.warning("cache: %s under %s are links to elsewhere: this cache is left alone (no eviction or clear)",
+                        ", ".join(linked), self.root)
+            self.managed = False
+        saved_cap = self._load_index()
+        self._cap = cap_bytes(cap_gb if cap_gb is not None else
+                              saved_cap / GB if saved_cap is not None else DEFAULT_CAP_GB)
+        self._thread = None
+        if start:
+            self._thread = threading.Thread(target=self._run, name="cache", daemon=True)
+            self._thread.start()
+
+    # --- layout ----------------------------------------------------------------------------------
+    def _check_version(self):
+        """True when this layout is ours (VERSION missing: written now); False leaves the cache alone."""
+        path = os.path.join(self.root, VERSION_FILE)
+        try:
+            with open(path) as f:
+                text = f.read().strip()
+        except FileNotFoundError:
+            text = ""
+        except OSError as e:
+            log.warning("cache: cannot read %s (%s): not managed", path, e)
+            return False
+        if not text:        # missing, or empty (a write cut short): no newer layout, ours from now on
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                os.makedirs(self.root, exist_ok=True)
+                with open(tmp, "w") as f:
+                    f.write(f"{LAYOUT_VERSION}\n")
+                os.replace(tmp, path)       # atomic: a second server never reads a half-written file
+            except OSError as e:
+                log.warning("cache: cannot write %s (%s): not managed", path, e)
+                return False
+            return True
+        if text == str(LAYOUT_VERSION):
+            return True
+        log.warning("cache: %s says layout %r (this server: %d): left alone (no eviction, no clear)",
+                    path, text[:40], LAYOUT_VERSION)
+        return False
+
+    def _key(self, path):
+        """The tracked key ("dem/..." with '/') of a path under the root, or None (outside, not tracked)."""
+        if not path.startswith(self._prefix):
+            path = os.path.abspath(path)
+            if not path.startswith(self._prefix):
+                return None
+        key = path[len(self._prefix):]
+        if os.sep != "/":
+            key = key.replace(os.sep, "/")
+        top = key.split("/", 1)[0]
+        # a file being written: "<path>.<pid>.<thread>.tmp", or mapdata's "....tmp.npz" (numpy appends .npz)
+        if top not in MANAGED and top not in KEPT and top not in MIRRORED or key.endswith((".tmp", ".tmp.npz")):
+            return None
+        return key
+
+    def _path(self, key):
+        return os.path.join(self.root, *key.split("/"))
+
+    @staticmethod
+    def _evictable(key, size):
+        return bool(size) and key.split("/", 1)[0] in MANAGED and not _marker(key, size)
+
+    def _floor(self):
+        """Files used at or after this time are protected (this process, within PROTECT_S)."""
+        return max(self.started, self.now() - PROTECT_S)
+
+    # --- the producers' hooks (any thread) --------------------------------------------------------
+    def used(self, path, size=None):
+        """A disk hit: last use = now (size if the caller knows it)."""
+        key = self._key(path)
+        if key is None:
+            return
+        t = self.now()
+        with self._lock:
+            e = self._entries.get(key)
+            if e is None:
+                self._entries[key] = [size, t]
+                if size is not None:
+                    self._used += size
+                if self.on_change is not None:
+                    self.on_change(key, True)
+            else:
+                e[1] = t
+                if size is not None and e[0] != size:
+                    self._used += size - (e[0] or 0)
+                    e[0] = size
+            self._dirty = True
+
+    def wrote(self, path, size=None):
+        """A file written (or replaced): its size (stat'ed when not given) and last use = now."""
+        if size is None:
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                return
+        ioprofiler.monitor.record_write(size)
+        self.used(path, size)
+        if self._cap and self._used > self._cap:
+            self._wake.set()
+
+    def read(self, path):
+        """A disk hit: marked used first (a pass running now keeps it), then read; a miss leaves no entry."""
+        self.used(path)
+        data = super().read(path)
+        if data is None:
+            self.forget(path)
+        else:
+            self.used(path, len(data))
+        return data
+
+    def forget(self, path):
+        """A file the producer removed itself (an undecodable tile)."""
+        key = self._key(path)
+        if key is None:
+            return
+        with self._lock:
+            e = self._entries.pop(key, None)
+            if e is not None:
+                self._used -= e[0] or 0
+                self._dirty = True
+                if self.on_change is not None:
+                    self.on_change(key, False)
+
+    # --- index -----------------------------------------------------------------------------------
+    def _load_index(self):
+        """Last uses from index.tsv (a damaged line is skipped, a damaged header drops the file: the
+        walk then takes the files' mtimes). Returns the saved cap (bytes) or None."""
+        path = os.path.join(self.root, INDEX_FILE)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                lines = f.read().split("\n")
+        except FileNotFoundError:
+            return None
+        except OSError as e:
+            log.warning("cache: index unreadable (%s): last uses from the files' times", e)
+            return None
+        head = lines[0].split("\t")
+        if head[0] != INDEX_HEADER:
+            log.warning("cache: index %s damaged (header %r): last uses from the files' times", path, lines[0][:60])
+            return None
+        cap = None
+        for item in head[1:]:
+            if item.startswith("cap="):
+                try:
+                    cap = cap_bytes(int(item[4:]) / GB)
+                except (ValueError, OverflowError):     # (a digit run too long for a float)
+                    cap = None
+        bad = 0
+        for line in lines[1:]:
+            if not line:
+                continue
+            parts = line.split("\t", 2)
+            try:
+                last, size, key = float(parts[0]), int(parts[1]), parts[2]
+            except (ValueError, IndexError):
+                bad += 1
+                continue
+            # a non-finite time ("nan", "-inf") would break the sort and every later save (int(nan))
+            if (size < 0 or not math.isfinite(last) or set(key.split("/")) & {"", ".", ".."}
+                    or self._key(self._path(key)) != key):
+                bad += 1
+                continue
+            # sizes are checked by the walk; a time from a clock that ran ahead must not protect a file
+            self._entries[key] = [size, min(last, self.started - 1)]
+        if bad:
+            log.warning("cache: index: %d damaged lines skipped", bad)
+        return cap
+
+    def save(self):
+        """Write index.tsv (atomically) if anything changed. Never for a cache left alone."""
+        if not self.managed:
+            return False
+        with self._lock:
+            if not self._dirty:
+                return False
+            rows = [f"{int(e[1])}\t{e[0]}\t{k}\n" for k, e in self._entries.items() if e[0] is not None]
+            cap = self._cap
+            self._dirty = False
+        path = os.path.join(self.root, INDEX_FILE)
+        tmp = f"{path}.{threading.get_ident()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(f"{INDEX_HEADER}\tcap={cap}\n")
+                f.writelines(rows)
+            os.replace(tmp, path)
+        except OSError as e:
+            log.warning("cache: index not saved: %s", e)
+            with self._lock:
+                self._dirty = True
+            return False
+        self._last_save = self.now()
+        return True
+
+    # --- the start-up walk -----------------------------------------------------------------------
+    def scan(self):
+        """Walk the tracked directories once: sizes, and the mtime as the last use of files the index
+        does not know; index entries without a file are dropped; files past their LIFETIMES go."""
+        found = {}
+        n_seen = 0
+        legacy = {}             # folder -> its old <y>.404 marker files (migrate_misses)
+        for top in MANAGED + MIRRORED + KEPT:
+            stack = [os.path.join(self.root, top)]
+            while stack:
+                d = stack.pop()
+                try:
+                    it = os.scandir(d)
+                except OSError:
+                    continue
+                with it:
+                    for de in it:
+                        n_seen += 1
+                        if n_seen % WALK_YIELD_N == 0:
+                            time.sleep(0.001)       # (the interpreter to the world's threads: WALK_YIELD_N)
+                        try:
+                            if de.is_dir(follow_symlinks=False):
+                                stack.append(de.path)
+                                continue
+                            if not de.is_file(follow_symlinks=False):
+                                continue
+                            key = self._key(de.path)
+                            if key is None:
+                                continue
+                            st = de.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        if self.managed and self._expired(key, st.st_mtime):
+                            try:
+                                os.remove(de.path)
+                                self.stats["expired"] += 1
+                            except OSError:
+                                pass
+                            continue
+                        found[key] = (st.st_size, st.st_mtime)
+                        if de.name.endswith(missindex.SUFFIX) and de.name[:-len(missindex.SUFFIX)].isdigit():
+                            legacy.setdefault(d, []).append((int(de.name[:-len(missindex.SUFFIX)]), st.st_mtime))
+        with self._lock:
+            entries = {}
+            for key, (size, mtime) in found.items():
+                e = self._entries.get(key)
+                if e is None:
+                    entries[key] = [size, min(mtime, self.started - 1)]
+                else:       # the index's last use; a newer download (a run without the index) counts too
+                    fresh = e[1] >= self.started and e[0] is not None     # written while the walk ran
+                    entries[key] = [e[0] if fresh else size, max(e[1], min(mtime, self.started - 1))]
+            # used / written while the walk ran (a file the walk passed before it existed)
+            for key, e in self._entries.items():
+                if key not in found and e[1] >= self.started and e[0] is not None:
+                    entries[key] = e
+            self._entries = entries
+            self._used = sum(e[0] for e in entries.values())
+            self._dirty = True
+            self.ready = True
+        self._ready_ev.set()
+        log.info("cache: %s in %d files under %s (cap %s)%s", _gb(self._used), len(entries), self.root,
+                 _gb(self._cap) if self._cap else "unlimited", "" if self.managed else "; left alone (VERSION)")
+        self.legacy_misses = legacy
+
+    def _expired(self, key, mtime):
+        for prefix, age in LIFETIMES.items():
+            if key.startswith(prefix) and self.now() - mtime > age:
+                return True
+        return False
+
+    # --- cap, eviction, clear --------------------------------------------------------------------
+    @property
+    def cap(self):
+        return self._cap
+
+    def set_cap(self, gb):
+        """A new cap (GB, 0 = unlimited): kept in the index, applied by the next eviction pass (at
+        once if that is due). True if it changed."""
+        b = cap_bytes(gb)
+        with self._lock:
+            if b == self._cap:
+                return False
+            self._cap = b
+            self._dirty = True
+        self._last_save = -1e18         # the cap is saved on the next tick
+        self._wake.set()
+        return True
+
+    def evict(self, target=None):
+        """Remove least recently used files until the tracked bytes are at most target (default:
+        LOW_WATER of the cap; nothing while under the cap). Returns (files, bytes) removed."""
+        if not self.managed or not self.ready:
+            return 0, 0
+        with self._lock:
+            cap = self._cap
+            if target is None:
+                if not cap or self._used <= cap:
+                    return 0, 0
+                target = int(cap * LOW_WATER)
+            floor = self._floor()
+            order = sorted((e[1], k) for k, e in self._entries.items()
+                           if self._evictable(k, e[0]) and e[1] < floor)
+        order = self._unpinned(order, lambda item: item[1])
+        self._last_evict = self.now()
+        n = b = 0
+        kept = self._kept_bytes()
+        held = []
+        for item in order:
+            key = item[1]
+            if self._used <= target:
+                break
+            keep = key.startswith(KEEP_PREFIXES)
+            if keep and kept <= KEEP_SHARE * target:
+                held.append(item)               # (taken only if the rest is not enough)
+                continue
+            got = self._remove(key, floor, empty_too=False)
+            if got is not None:
+                n, b = n + 1, b + got
+                if keep:
+                    kept -= got
+        for _, key in held:
+            if self._used <= target:
+                break
+            got = self._remove(key, floor, empty_too=False)
+            if got is not None:
+                n, b = n + 1, b + got
+        if n:
+            self.stats["evicted"] += n
+            self.stats["evicted_bytes"] += b
+            log.info("cache: evicted %d least recently used files (%s); %s of %s in use", n, _gb(b),
+                     _gb(self._used), _gb(cap) if cap else "unlimited")
+        return n, b
+
+    def _kept_bytes(self):
+        """Bytes of the tracked KEEP_PREFIXES files."""
+        with self._lock:
+            return sum(e[0] or 0 for k, e in self._entries.items() if k.startswith(KEEP_PREFIXES))
+
+    def _unpinned(self, items, key_of):
+        """items without the ones whose key is in a saved area (pinned; outside the lock: a batch call)."""
+        pinned = self.pinned
+        if not items:
+            return items
+        keys = [key_of(it) for it in items]
+        mask = [False] * len(keys)
+        if pinned is not None:
+            try:
+                mask = list(pinned(keys))
+            except Exception as e:      # (no pins rather than no eviction)
+                log.warning("cache: saved areas not checked: %s", e)
+        try:                            # (and the prebaked input tiles' downloaded regions: bnwt.download_region)
+            import bnwt
+            got = bnwt.pinned_keys(self.root, keys)
+            if got is not None:
+                mask = [a or b for a, b in zip(mask, got)]
+        except Exception as e:
+            log.warning("cache: downloaded regions not checked: %s", e)
+        try:                            # (the shared decision archives' downloaded regions: decisions.download_region)
+            import decisions
+            got = decisions.pinned_keys(self.root, keys)
+            if got is not None:
+                mask = [a or b for a, b in zip(mask, got)]
+        except Exception as e:
+            log.warning("cache: downloaded decision regions not checked: %s", e)
+        return [it for it, p in zip(items, mask) if not p]
+
+    def keys(self):
+        """A snapshot of the tracked keys (the map's cache view builds its index from it once)."""
+        with self._lock:
+            return list(self._entries)
+
+    def sizes(self, keys=None):
+        """[(key, bytes)] of the tracked files with a known size (all, or those of keys)."""
+        with self._lock:
+            if keys is None:
+                return [(k, e[0]) for k, e in self._entries.items() if e[0] is not None]
+            out = []
+            for k in keys:
+                e = self._entries.get(k)
+                if e is not None and e[0] is not None:
+                    out.append((k, e[0]))
+            return out
+
+    def _remove(self, key, floor, empty_too, mirrored_too=False):
+        """Delete one tracked file unless it was used since `floor` (checked under the lock, so a
+        producer's used() a moment earlier wins). mirrored_too: MIRRORED files too (clear). Bytes removed, or None."""
+        with self._lock:
+            e = self._entries.get(key)
+            top = key.split("/", 1)[0]
+            if e is None or e[1] >= floor or not (self._evictable(key, e[0]) or
+                                                  empty_too and _marker(key, e[0]) and top in MANAGED or
+                                                  mirrored_too and top in MIRRORED):
+                return None
+            path = self._path(key)
+            if not _inside(path, self.root):       # (never a file whose real place is outside this cache)
+                return None
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            except OSError as err:
+                log.debug("cache: cannot remove %s: %s", key, err)
+                return None
+            del self._entries[key]
+            self._used -= e[0] or 0
+            self._dirty = True
+            if self.on_change is not None:
+                self.on_change(key, False)
+            return e[0] or 0
+
+    def walk_soon(self):
+        """Start the start-up walk now instead of after WALK_DELAY_S (a clear, the map's cache view: they wait for it)."""
+        self._walk_now.set()
+
+    def clear(self, wait=60.0):
+        """"Clear cache": every MANAGED (and MIRRORED) file but the ones used within CLEAR_KEEP_S (the place around the
+        player; a file still in a producer's memory is fetched or built again if it is needed after all; gravity/,
+        airports/ and netstats/ stay). Waits up to `wait` s for the start-up walk. Returns
+        (files, bytes)."""
+        self.walk_soon()
+        if not self.managed or not self._ready_ev.wait(wait):
+            return 0, 0
+        # (only the last CLEAR_KEEP_S: everything this session had used stayed, and after a long drive "Clear cache"
+        # cleared nearly nothing, a player 2026-11-03)
+        floor = self.now() - CLEAR_KEEP_S
+        with self._lock:
+            keys = [k for k, e in self._entries.items() if e[1] < floor and k.split("/", 1)[0] in MANAGED + MIRRORED]
+        keys = self._unpinned(keys, lambda k: k)
+        n = b = 0
+        for key in keys:
+            got = self._remove(key, floor, empty_too=True, mirrored_too=True)
+            if got is not None:
+                n, b = n + 1, b + got
+        self.stats["cleared"] += n
+        self.stats["cleared_bytes"] += b
+        log.info("cache: cleared %d files (%s); %s left (this session's and the gravity model)", n, _gb(b),
+                 _gb(self._used))
+        self.save()
+        return n, b
+
+    # --- status ----------------------------------------------------------------------------------
+    def usage(self):
+        """(bytes, files) tracked now. No lock: the event loop asks (the 'cache' message), and an
+        eviction pass or an index save holds the lock for a few tenths of a second on a full cache;
+        two reads of a moment apart are good enough for the page."""
+        return self._used, len(self._entries)
+
+    def message(self, cleared=None):
+        """The `cache` message for the mod's settings page (cleared: bytes freed by a clear)."""
+        used, files = self.usage()
+        m = {"type": "cache", "v": MSG_VERSION, "usedBytes": int(used), "capBytes": int(self._cap),
+             "files": files, "ready": self.ready, "managed": self.managed}
+        if cleared is not None:
+            m["clearedBytes"] = int(cleared)
+        if self.pinned_bytes is not None:
+            m["pinnedBytes"] = int(self.pinned_bytes)
+        return m
+
+    # --- the background thread -------------------------------------------------------------------
+    def disk_short(self, wait=False):
+        """Bytes the cache's disk is short of its free-space reserve (DISK_RESERVE_*), 0 when it has it (or when the
+        disk cannot be asked). The disk is asked at most every DISK_CHECK_S, on a thread of its own; the answer is the
+        last one it gave (0 before the first): asked on every pose (refresh_status -> net_note), a busy hard disk took
+        2.6-9.9 s to answer on Windows and stalled the event loop 19 times in 23 minutes (GitHub #1054). wait: ask
+        now and wait for the answer (eviction's own check, off the loop)."""
+        now = time.monotonic()
+        if wait:
+            self._disk_check(now)
+        elif now - self._disk_at >= DISK_CHECK_S and not self._disk_busy:
+            self._disk_busy = True
+            threading.Thread(target=self._disk_check, args=(now,), name="cache disk check", daemon=True).start()
+        return self._disk_short
+
+    def _disk_check(self, now):
+        try:
+            du = self.disk_usage(self.root)
+            reserve = min(DISK_RESERVE_MAX, max(DISK_RESERVE_MIN, du.total * DISK_RESERVE_SHARE))
+            self._disk_short = int(max(0, reserve - du.free))
+        except OSError:
+            self._disk_short = 0
+        finally:
+            self._disk_at = now
+            self._disk_busy = False
+
+    def tick(self):
+        """One check: evict when over the cap or when the disk runs short of its free reserve (at most every EVICT_S),
+        save the index (every SAVE_S)."""
+        if not self.ready:
+            return
+        now = self.now()
+        cap = self._cap
+        due = self._last_evict is None or now - self._last_evict >= EVICT_S
+        short = self.disk_short(wait=True) if self.managed else 0
+        if short and due:
+            target = max(0, self._used - short - int(DISK_MARGIN))
+            if self._used > target:
+                if not self._disk_warned:
+                    log.warning("cache: the disk has %s free, under its reserve: the cache is cut back to %s (the "
+                                "cap is %s)", _gb(self.disk_usage(self.root).free), _gb(target),
+                                _gb(cap) if cap else "unlimited")
+                    self._disk_warned = True
+                self.evict(target=target)
+                due = False
+        if cap and self._used > cap and due:
+            self.evict()
+        if now - self._last_save >= SAVE_S:
+            self.save()
+
+    def migrate_misses(self):
+        """The old per-tile 404 markers (<y>.404, empty files) the start-up walk found moved into their columns' miss
+        indexes (missindex.migrate: a line each, then the file deleted), then every source folder under MISS_TOPS
+        flagged as having none left (lookups there skip the old-marker stat). A cache left alone is not touched.
+        -> markers migrated."""
+        legacy, self.legacy_misses = self.legacy_misses, {}
+        if not self.managed:
+            return 0
+        t0 = time.monotonic()
+        n, failed = 0, set()
+        for d, found in legacy.items():
+            if self._closed:
+                return n            # (no flags: the next start goes on)
+            got = missindex.migrate(d, disk=self, found=found)
+            if got is None or got < len(found):
+                failed.add(missindex._source_of(d))
+            n += got or 0
+        flags = sum(missindex.flag_sources(os.path.join(self.root, top), skip=failed) for top in MISS_TOPS)
+        if n or flags:
+            log.info("cache: %d old 404 marker files moved into %d miss indexes in %.1f s (%d source folders "
+                     "flagged%s)", n, len(legacy), time.monotonic() - t0, flags,
+                     f"; {len(failed)} left for the next start" if failed else "")
+        return n
+
+    def _run(self):
+        self._walk_now.wait(WALK_DELAY_S)       # (at once when something needs it: walk_soon)
+        if self._closed:
+            return
+        try:
+            self.scan()
+        except Exception:
+            log.exception("cache: start-up walk failed; no eviction this session")
+            return
+        # (its own thread: deleting ~200k old marker files, or a cleared cache, takes minutes on Windows; eviction must
+        # not wait for it)
+        threading.Thread(target=self._background, name="cache-sweep", daemon=True).start()
+        while not self._closed:
+            try:
+                self.tick()
+            except Exception:           # never take the server down; try again next tick
+                log.exception("cache: eviction / index save failed")
+            self._wake.wait(TICK_S)
+            self._wake.clear()
+
+    def _background(self):
+        """After the start-up walk, on a thread of its own: the old 404 markers migrated, then what a clear_all moved
+        aside deleted."""
+        try:
+            self.migrate_misses()
+        except Exception:
+            log.exception("cache: old 404 markers not migrated")
+        try:
+            if self.managed:
+                sweep_trash(self.root)
+        except Exception:
+            log.exception("cache: cleared folders not deleted")
+
+    def close(self):
+        """Stop the thread and save the index (the server's shutdown)."""
+        self._closed = True
+        self._wake.set()
+        self._walk_now.set()
+        if self._thread is not None:
+            self._thread.join(5.0)
+        if self.ready:
+            self.save()
+
+
+TRASH = "_trash"            # clear_all's folders, moved aside and deleted in the background (sweep_trash)
+
+
+def clear_all(root):
+    """The fast "delete the whole download cache" (the launcher's --clear-cache; GitHub #1081: a player waited a very
+    long time deleting the cache folder's hundreds of thousands of small files): every MANAGED and MIRRORED folder is
+    renamed into <root>/_trash/<stamp>/ (instant: a rename each, on the same disk), and deleted later in the background
+    (sweep_trash: the server does it at its start, so nobody waits for it). gravity/, airports/, netstats/, the logs
+    and index.tsv (its cap) stay; the server's start-up walk drops the index's lines of the files gone. Not while a
+    server uses the cache (the caller checks). A cache of another layout (VERSION) or whose folders are links is left
+    alone. -> the folders moved ([] when there was nothing, or the cache is not ours)."""
+    root = os.path.abspath(root)
+    try:
+        with open(os.path.join(root, VERSION_FILE)) as f:
+            text = f.read().strip()
+    except FileNotFoundError:
+        text = ""
+    except OSError:
+        return []
+    if text and text != str(LAYOUT_VERSION):
+        return []
+    tops = [t for t in MANAGED + MIRRORED if os.path.isdir(os.path.join(root, t))]
+    if any(os.path.islink(os.path.join(root, t)) for t in tops):
+        return []
+    dest = os.path.join(root, TRASH, f"{int(time.time())}-{os.getpid()}")
+    moved = []
+    for t in tops:
+        try:
+            os.makedirs(dest, exist_ok=True)
+            os.rename(os.path.join(root, t), os.path.join(dest, t))
+            moved.append(t)
+        except OSError as e:            # (a file held open on Windows: that folder stays, cleared file by file later)
+            log.warning("cache: %s not moved aside: %s", t, e)
+    return moved
+
+
+def sweep_trash(root):
+    """Delete what clear_all moved aside (<root>/_trash), oldest first. Safe to run in several processes at once and to
+    stop at any time (the rest goes at the next call). -> folders deleted."""
+    d = os.path.join(os.path.abspath(root), TRASH)
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return 0
+    n = 0
+    for name in names:
+        p = os.path.join(d, name)
+        if os.path.islink(p):
+            continue
+        shutil.rmtree(p, ignore_errors=True)
+        if not os.path.exists(p):
+            n += 1
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
+    if n:
+        log.info("cache: %d cleared cache folder(s) deleted in the background", n)
+    return n
+
+
+def prune_dir(root, max_bytes, keep_s=600.0, match=None, now=None):
+    """The caches that keep their own files outside MANAGED (sea carving's raw rasters, compute sharing's replies,
+    the road widths' walls): the oldest files (mtime; their readers touch the ones they use) under root removed until
+    at most max_bytes are left; files changed within keep_s stay; match(file name) selects files (None: all). A file
+    that cannot be removed (mapped by a running process on Windows) is skipped. -> (files removed, bytes left)"""
+    now = time.time() if now is None else now
+    files, total = [], 0
+    for dirpath, _dirs, names in os.walk(root):
+        for n in names:
+            if match is not None and not match(n):
+                continue
+            p = os.path.join(dirpath, n)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+    removed = 0
+    if total > max_bytes:
+        for mtime, size, p in sorted(files):
+            if total <= max_bytes * LOW_WATER or now - mtime < keep_s:
+                break
+            try:
+                os.remove(p)
+            except OSError:
+                continue
+            total -= size
+            removed += 1
+    return removed, total
+
+
+def prune_versions(root, keep):
+    """The version folders under root ("v<n>": vegetation/v18, seacarve/v19, roadwidth/v2) but keep removed: a
+    generator update writes a new folder and never reads the old one again. Anything else under root stays.
+    -> (folders removed, bytes freed)"""
+    import re
+    import shutil
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0, 0
+    n = freed = 0
+    for name in names:
+        p = os.path.join(root, name)
+        if name == keep or not re.fullmatch(r"v\d+", name) or not os.path.isdir(p) or os.path.islink(p):
+            continue
+        size = 0
+        for dirpath, _dirs, files in os.walk(p):
+            for f in files:
+                try:
+                    size += os.path.getsize(os.path.join(dirpath, f))
+                except OSError:
+                    pass
+        shutil.rmtree(p, ignore_errors=True)
+        if not os.path.exists(p):
+            n, freed = n + 1, freed + size
+    return n, freed
+
+
+_touched = set()
+_touched_lock = threading.Lock()
+
+
+def touch_once(path):
+    """Mark a self-managed cache file used (its mtime now, prune_dir's order), once per process."""
+    with _touched_lock:
+        if path in _touched:
+            return
+        _touched.add(path)
+    try:
+        os.utime(path, None)
+    except OSError:
+        pass
+
+
+def _gb(b):
+    return f"{b / GB:.2f} GB"

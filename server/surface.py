@@ -1,0 +1,1938 @@
+"""Ground surfaces under the physics block (docs/ROADMAP.md v1.5 "Per-cell surface physics"; earthd
+--surface, on by default since 2026-10-11).
+
+The TerrainBlock is physics-only in mesh mode, so its layer map decides nothing but the tyres'
+ground model (and GroundCover, which binds to a layer). Every 2 m sample of the block gets one of
+MATERIALS from the ESA WorldCover class under it (docs/research/2026-10-10-world-data-sources.md
+§5.4, without the OSM overrides yet) and the slope (ROCK where steeper than ROCK_SLOPE_DEG); the
+server writes one 0/255 mask per material next to the heightmap and the mod imports them with the
+block (8 greyscale masks: +4-5 ms per 512² import, docs/research/2026-10-11-engine-probes.md).
+
+Land cover comes from the map-data cache (mapdata.py "landcover" layer, per z14 cell). Building a
+block never waits for the network: a cell that is not cached yet reads as "no data" (DIRT, the
+material the block had before this module) and is fetched in the background (prefetch around the
+player, kind "prefetch"); the blocks built after it arrives have the right surfaces. The masks are a
+pure function of the cached land cover and the heights, so a block rebuilt from a complete cache is
+the same every time.
+"""
+import hashlib
+from runtimeprofiler import step as profile_step
+import logging
+import math
+from collections import OrderedDict
+import os
+import struct
+import threading
+import time
+import weakref
+from runtimeprofiler import ThreadPoolExecutor
+
+import numpy as np
+from PIL import Image, ImageDraw
+
+import beaches
+import fast
+import dmath
+import dnp
+import groundclass
+import mapgeom
+import heightmap
+import mapcells
+import revisit
+import roads as roadsmod
+import staging
+
+log = logging.getLogger("earthd.surface")
+
+VERSION = 1
+# (TerrainMaterial name, BeamNG ground model). The last one is the level's own dirt material: the
+# default, and the one every block had before (an all-zero sample falls to the later layer on ties,
+# docs/research/2026-10-10-world-data-sources.md §4.4, so DIRT goes last).
+# Names carry their own prefix: "bngEarthSnow" is the weather's Precipitation object (weather.lua), and
+# a TerrainMaterial of that name was never made - its layer fell back to asphalt (in-game 2026-10-11).
+MATERIALS = (
+    ("bngEarthGroundAsphalt", "ASPHALT_OLD"),
+    ("bngEarthGroundGrass", "GRASS"),
+    ("bngEarthGroundDusty", "DIRT_DUSTY"),
+    ("bngEarthGroundLoose", "DIRT_DUSTY_LOOSE"),
+    ("bngEarthGroundRock", "ROCK"),
+    ("bngEarthGroundSnow", "SNOW"),
+    ("bngEarthGroundMud", "MUD"),
+    ("bngEarthGroundCobble", "COBBLESTONE"),      # roads with paving stones / setts (roads.py "cobble")
+    ("bngEarthGroundLawn", "GRASS"),              # mown yards in towns (short grass only, groundcover.lua)
+    # Golf (Overture land_use, OSM golf=*). Not GroundCover layers, so the 3D grass stays off them.
+    ("bngEarthGroundGolfRough", "GRASS"),
+    ("bngEarthGroundGolfFairway", "GRASS"),
+    ("bngEarthGroundGolfGreen", "GRASS"),
+    ("bngEarthGroundGolfBunker", "SAND"),
+    # Squares (paint_plazas): flat-topped pavers and red brick, the drawn block's detail texture over the photo (the
+    # user, 2026-11-11: "instead could we paint the plaza and apply a texture to it like the roads")
+    ("bngEarthGroundPavers", "ASPHALT_OLD"),
+    ("bngEarthGroundBrick", "COBBLESTONE"),
+    ("beamngEarthDirt", "DIRT"),
+)
+ASPHALT, GRASS, DUSTY, LOOSE, ROCK, SNOW, MUD, COBBLE, LAWN, \
+    GOLF_ROUGH, GOLF_FAIRWAY, GOLF_GREEN, GOLF_BUNKER, PAVERS, BRICK, DIRT = range(len(MATERIALS))
+# WorldCover class -> material (§5.4 of the world-data research). Built-up land is the plain dirt layer
+# (2026-10-14): its yards, lawns and lots took the asphalt layer's grey detail and macro textures, which
+# washed whole towns pale grey in the street photos (Moab, Frederick); the roads are painted asphalt anyway
+# (paint_roads), and the photo's own colours now show through.
+CLASS_MATERIAL = {0: DIRT, 10: GRASS, 20: DUSTY, 30: GRASS, 40: DIRT, 50: DIRT, 60: LOOSE, 70: SNOW,
+                  80: MUD, 90: MUD, 95: MUD, 100: GRASS}
+# Lawns (2026-10-14, street photos of Ocean City, Lancaster, Frederick, Moab): built-up land between the
+# buildings is mostly mown grass, which the dirt layer drew pale and bare. A share of it is LAWN, in patches
+# of smooth noise on a fixed world grid: most of it where the climate is humid, less in the dry West (yards
+# of gravel and dirt there). The rest stays dirt (lots, gravel, bare yards); roads and lots paint over both.
+LAWN_SHARE_HUMID = 0.9
+LAWN_SHARE_DRY = 0.75
+LAWN_PATCH_M = 30.0
+# Past Web Mercator's limit (+-85.05 deg) there are no map cells: all of it is ice, Antarctica's ice sheet and the
+# Arctic Ocean's year-round sea ice (the user, 2026-10-22: "add polar support"), WorldCover's "snow and ice".
+POLAR_CLASS = 70
+ROCK_SLOPE_DEG = 35.0       # steeper ground is rock (cliffs, scree), except snow
+# Organic borders (user 2026-10-11: rectangular grass in Monument Valley). WorldCover's 10 m square
+# pixels give stair-stepped, ruler-straight class borders, which the grass makes visible. Every
+# sample reads the land cover a few metres off, by smooth value noise on a fixed world grid (no
+# state, the same for every block): (feature size m, amplitude m) per octave.
+WARP_OCTAVES = ((40.0, 8.0), (12.0, 3.0))
+M_PER_DEG = 111320.0
+PREFETCH_M = 3000.0         # land cover is fetched this far around the player
+PREFETCH_MOVE_M = 500.0     # ... again after the player moved this far
+
+# The photo's ground classes (groundclass.py, Leonberg's baked map) -> material, painted over the land cover where it says
+# built-up (stone and red paving anywhere): paving stones flat pavers, red paving brick, bare ground dirt (the dry beige
+# the photo shows in a yard is no loose gravel: that is for the roads' own verdicts), grass a lawn, grey hard ground
+# asphalt (the yards, lots and drives the map leaves out)
+GROUND_LAYER = {groundclass.ASPHALT: ASPHALT, groundclass.STONE: PAVERS, groundclass.RED: BRICK,
+                groundclass.GRAVEL: DIRT, groundclass.SOIL: DIRT, groundclass.GRASS: LAWN}
+
+_LUT = np.full(256, DIRT, np.uint8)
+for _c, _m in CLASS_MATERIAL.items():
+    _LUT[_c] = _m
+
+
+def dry_west(lat, lon):
+    """The arid West (a coarse climate stand-in, vegetation.regional's): its towns have fewer lawns."""
+    lat, lon = np.asarray(lat), np.asarray(lon)
+    return (lon < -102.0) & (lat > 25.0) & (lat < 46.0) & ~((lon < -121.0) & (lat > 37.0))
+
+
+def lawns(lat, lon):
+    """True where built-up land is a lawn (LAWN_* above). A pure function of the world position."""
+    lat = np.asarray(lat, np.float64)
+    lon = np.asarray(lon, np.float64)
+    xm = lon * M_PER_DEG * dnp.cos(np.radians(lat))
+    ym = lat * M_PER_DEG
+    n = 0.65 * _value_noise(xm / LAWN_PATCH_M, ym / LAWN_PATCH_M, 5) \
+        + 0.35 * _value_noise(xm / (LAWN_PATCH_M / 3), ym / (LAWN_PATCH_M / 3), 6)
+    share = np.where(dry_west(lat, lon), LAWN_SHARE_DRY, LAWN_SHARE_HUMID)
+    # threshold near the noise sum's share quantile (see the test)
+    return n > (0.5 - share) * 1.1
+
+
+def classify(classes, u, square, lat=None, lon=None):
+    """Material index per sample: the land-cover class's material, ROCK where the slope of the
+    height grid u (metres, [row, col], `square` m apart) is steeper than ROCK_SLOPE_DEG (snow stays
+    snow). With the samples' positions, built-up land is LAWN where lawns() says. Pure."""
+    classes = np.asarray(classes, np.uint8)
+    idx = _LUT[classes]
+    if lat is not None and lon is not None:
+        # (KyzoFox 1.5.4: lawns() only at the built-up samples, the only ones it can change: on rural ground
+        # that is almost none of a block)
+        urban = classes == 50
+        if urban.any():
+            idx = idx.copy()
+            sub = idx[urban]
+            sub[lawns(np.asarray(lat, np.float64)[urban], np.asarray(lon, np.float64)[urban])] = np.uint8(LAWN)
+            idx[urban] = sub
+    sand = beaches.sand_grid(classes, square)      # a beach's grassland pixels: bare sand, no grass (GitHub #578)
+    if sand.any():
+        idx = np.where(sand, np.uint8(LOOSE), idx)
+    if lat is not None and lon is not None:
+        idx = groundclass.apply_layers(idx, classes, lat, lon, GROUND_LAYER)    # (Leonberg's photo: groundclass.py)
+    u = np.asarray(u, np.float64)
+    if min(u.shape) < 2:            # no slope from a single row / column
+        return idx.astype(np.uint8)
+    gy, gx = np.gradient(u, square)
+    steep = (gx * gx + gy * gy) > dnp.sq(dmath.tan(math.radians(ROCK_SLOPE_DEG)))
+    return np.where(steep & (idx != SNOW), np.uint8(ROCK), idx).astype(np.uint8)
+
+
+def _value_noise(x, y, seed):
+    """Smooth value noise in [-1, 1] at points (x, y) given in lattice units."""
+    return _value_noises(x, y, (seed,))[0]
+
+
+def _value_noises(x, y, seeds):
+    """_value_noise(x, y, seed) for each of seeds (warp's dx and dy share their points): earthfast.value_noises (the
+    hash of each lattice corner, smoothstep weights, bilinear; ported 2026-11-01 from the numpy version, the same
+    values bit for bit)."""
+    fast.require(139, "value noise")
+    x = np.asarray(x, np.float64)
+    y = np.asarray(y, np.float64)
+    out = fast._ef.value_noises(np.ascontiguousarray(x.ravel()), np.ascontiguousarray(y.ravel()),
+                                [int(v) for v in seeds])
+    return [o.reshape(x.shape) for o in out]
+
+
+def warp(lat, lon):
+    """(lat, lon) moved by a few metres of smooth noise (WARP_OCTAVES): where each sample reads the
+    land cover, so class borders follow organic curves instead of the 10 m pixel grid. A pure
+    function of the world position (blocks agree along their shared samples). Pure."""
+    lat = np.asarray(lat, np.float64)
+    lon = np.asarray(lon, np.float64)
+    m_lon = M_PER_DEG * dnp.cos(np.radians(lat))
+    xm = lon * m_lon                     # metres east of the lon 0 meridian (at this latitude)
+    ym = lat * M_PER_DEG                 # metres north of the equator
+    dx = np.zeros_like(lat)
+    dy = np.zeros_like(lat)
+    for k, (size, amp) in enumerate(WARP_OCTAVES):
+        nx, ny = _value_noises(xm / size, ym / size, (2 * k + 1, 2 * k + 2))
+        dx += amp * nx
+        dy += amp * ny
+    return lat + dy / M_PER_DEG, lon + dx / np.maximum(m_lon, 1e-6)
+
+
+# road surface kind (roads.py) -> material; drawn in this order (paved last: it wins at junctions)
+ROAD_MATERIAL = {"dirt": DIRT, "gravel": LOOSE, "cobble": COBBLE, "paved": ASPHALT,
+                 "rock": ROCK, "grass": GRASS}     # rock and grass roads: the ground's own materials (roads.terrain_surface)
+ROAD_ORDER = ("dirt", "gravel", "rock", "grass", "cobble", "paved")
+
+
+def grid_affine(lat, lon):
+    """Least-squares affine map (lon, lat) -> (col, row) of a sample grid given by its lat / lon arrays
+    (a 1 km block is affine to well under a centimetre). Returns a function (lon, lat) -> (col, row)."""
+    lat = np.asarray(lat, np.float64)
+    lon = np.asarray(lon, np.float64)
+    h, w = lat.shape
+    step = max(1, min(h, w) // 16)
+    rr, cc = np.mgrid[0:h:step, 0:w:step]
+    la, lo = lat[rr, cc].ravel(), lon[rr, cc].ravel()
+    lo0, la0 = float(lo.mean()), float(la.mean())
+    A = np.stack([lo - lo0, la - la0, np.ones_like(lo)], axis=1)
+    coef, *_ = dnp.lstsq(A, np.stack([cc.ravel(), rr.ravel()], axis=1).astype(np.float64), rcond=None)
+
+    def f(lon_, lat_):
+        B = np.stack([np.asarray(lon_, np.float64) - lo0, np.asarray(lat_, np.float64) - la0,
+                      np.ones(np.shape(lon_))], axis=-1)
+        cr = dnp.matmul(B, coef)
+        return cr[..., 0], cr[..., 1]
+    return f
+
+
+def _lonlat_boxes(feats):
+    """(n, 4) lon min / max, lat min / max of each feature's coordinates (+-inf for none), kept with the feats."""
+    got = feats.__dict__.get("_lonlat_boxes")
+    if got is not None:
+        return got
+    n = len(feats)
+    got = np.empty((n, 4))
+    got[:, 0::2], got[:, 1::2] = np.inf, -np.inf
+    a = feats.coord_off[feats.ring_off[feats.part_off[:-1]]]
+    b = feats.coord_off[feats.ring_off[feats.part_off[1:]]]
+    rows = np.flatnonzero(b > a)
+    if len(rows):
+        ll = feats.lonlat
+        for col, (u, f) in enumerate([(0, np.minimum), (0, np.maximum), (1, np.minimum), (1, np.maximum)]):
+            got[rows, col] = mapgeom._reduce(f, ll[:, u], a[rows], b[rows])
+    feats.__dict__["_lonlat_boxes"] = got
+    return got
+
+
+ROAD_EDGE_M = 0.5 * heightmap.SQUARE  # m past a carriageway's edge its material reaches: a square whose centre is at most this far out
+                     # is road (a 1 m square reaches back up to 0.7 m; at 2 m squares this was 1.0: at 0.5 a wheel 0.2 m
+                     # inside a 9 m road's edge was on dirt; the grain beyond lies under the edge decal, roads.EDGE_DECAL)
+
+
+@profile_step('Surface road paint')
+def paint_roads(idx, lat, lon, feats_list, square, urban_fn=None, widths=None, extra=(), quick=False):
+    """idx (material per sample, [row, col], as classify gives it) with the roads of feats_list (the
+    "roads" Features of the cells around) drawn in at their width: ROAD_MATERIAL by surface kind.
+    lat / lon: the samples' positions; square: m between samples; urban_fn: as roads.road_specs (the
+    same widths as the drawn roads); extra: [(lat (k,), lon (k,), roads.Spec)] more roads (a tunnel's open
+    sections, grading.Grader.open_tunnels). Each sample is a road's when it lies within the road's half width
+    (+ ROAD_EDGE_M) of its line (earthfast.mask_segments): PIL's thick lines put the material half a sample off the line
+    and an odd number of samples wide (an 11 m road painted 14 m, 1.4 m to one side: the asphalt's grain beyond the
+    edge line, GitHub #402). The engine gives each square the material of its south-west sample (the ground model under
+    a wheel and the detail texture both: a car 1.4 m inside a 9 m road's edge was on dirt, and the dirt's grain lay over
+    the asphalt along one edge; wheels swept across the edges in game, 2026-10-28): a sample is tested at the centre of
+    the square north-east of it. quick: a stand-in block's paint (the map's own bridge / tunnel tags, no rounded
+    corners, no width tapers: nothing that waits on the session's lidar decisions, roads.quick_ground_parts; the
+    tapers' bridge specs held a cold Bozeman stand-in 16.5 s). Pure (a new array)."""
+    import europewalks
+
+    european = europewalks.enabled()
+    h, w = idx.shape
+    grid = grid_affine(lat, lon)
+    la_c, lo_c = float(np.mean(lat)), float(np.mean(lon))
+    m_lat = 1.0 / 111320.0
+    m_lon = m_lat / max(dmath.cos(math.radians(la_c)), 1e-6)
+    c0_, r0_ = grid(lo_c, la_c)
+    c1_, r1_ = grid(lo_c + m_lon * square / 2, la_c + m_lat * square / 2)
+    dc, dr = float(c1_ - c0_), float(r1_ - r0_)        # half a square east and north, in samples
+
+    def to_px(x, y):
+        c, r = grid(x, y)
+        return c - dc, r - dr
+    segs = {k: ([], []) for k in ROAD_ORDER}    # kind -> (segments (m, 4) in samples, half widths in samples)
+    lawn, verge, grass_verge = ([], []), ([], []), ([], [])
+    footpaths = ([], [])
+    seen = set()
+    # The rural grass treatment is local to Romania and Hungary.
+    eastern = european and 43. < la_c < 50. and 15. < lo_c < 31.
+
+    def add(dst, c, r, half):
+        if len(c) >= 2:
+            dst[0].append(np.stack([c[:-1], r[:-1], c[1:], r[1:]], axis=1))
+            half = np.asarray(half, np.float64)         # (per point where the road tapers: each segment's mean)
+            dst[1].append(np.full(len(c) - 1, half / square) if half.ndim == 0 else (half[:-1] + half[1:]) / 2 / square)
+
+    def line(x, y, spec, aisle, tapers=()):
+        width, kind = spec.width, roadsmod.surface_material_kind(spec)
+        ws = roadsmod.taper_widths(spec.width, tapers, x, y)     # (its width along it where it tapers: road_tapers)
+        if ws is not None:
+            width = ws
+        if aisle:
+            width += 2 * AISLE_STALLS_M         # the stalls either side (parking.aisle_spots): no grass under cars
+        walks = roadsmod.has_sidewalks(spec)
+        street = getattr(spec, "street", None)
+        band = 0.0
+        if walks and street is None:
+            band = 2 * (spec.walk + square)     # the sidewalks (+ a sample: tufts at the outer edge): grass grew up
+                                                # through them (ground cover is the terrain's: Lauterbrunnen, Baltimore
+                                                # 2026-10-15); paved (footpaths), not the road's own material: a
+                                                # cobbled road's setts lay a metre past its sidewalks on the lawn (the
+                                                # user, 2026-11-11 at Washington Place: "the textures dont seem to
+                                                # match the border of the paint collor")
+        c, r = to_px(x, y)
+        c, r = np.asarray(c, np.float64), np.asarray(r, np.float64)
+        edge_reach = max((walk.setback + walk.width for _, walk in street.walks()), default=0.) if street else 0.
+        reach = (float(np.max(width)) / 2 + band / 2 + ROAD_EDGE_M + max(edge_reach, 0 if walks else VERGE_M)) \
+            / square + 2
+        if c.max() < -reach or c.min() > w + reach or r.max() < -reach or r.min() > h + reach:
+            return
+        add(segs[kind], c, r, width / 2 + ROAD_EDGE_M)
+        if band:
+            add(footpaths, c, r, (width + band) / 2 + ROAD_EDGE_M)
+        if street is not None:
+            for side, walk in street.walks():
+                # Independent strips leave the setback to the original ground.
+                ll = np.c_[x, y]
+                scale = np.array([111320. * dmath.cos(math.radians(float(np.mean(y)))), 110540.])
+                offset = side * (width / 2 + walk.setback + walk.width / 2)
+                xy = roadsmod.offset_polyline(np.c_[(ll - ll[0]) * scale, np.zeros(len(ll))], offset)
+                wc, wr = to_px(*(xy[:, :2] / scale + ll[0]).T)
+                add(footpaths, wc, wr, walk.width / 2 + .15)
+            if not street.walks():
+                add(verge, c, r, width / 2 + ROAD_EDGE_M + .45)
+        elif not walks:
+            add(verge, c, r, width / 2 + ROAD_EDGE_M + VERGE_M)    # (VERGE_M past the road's material)
+        if eastern and kind == "paved" and spec.cls in europewalks.STREETS and not spec.link and not spec.median:
+            mid = len(x) // 2
+            country = europewalks.country_for(float(x[mid]), float(y[mid]))
+            if europewalks.grassy_verges(country, float(x[mid]), float(y[mid])):
+                add(grass_verge, c, r, width / 2 + ROAD_EDGE_M + 2.6)
+
+    copies = roadsmod.copies_of(feats_list)     # (each joint's taper from its own cell: roads.joint_desc)
+    import geodesy
+    placement = roadsmod.placement_context(feats_list, urban_fn, widths)   # (where the road tiles draw them)
+    pfr = geodesy.EnuFrame(la_c, lo_c) if placement.on else None
+
+    def taper_of(f):
+        return roadsmod.road_tapers(f, urban_fn, widths)
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        specs = roadsmod.road_specs(feats, urban_fn, widths)
+        box = _lonlat_boxes(feats)
+        bc, br = to_px(box[:, [0, 1, 0, 1]], box[:, [2, 2, 3, 3]])     # the boxes' corners on the grid
+        c_lo, c_hi, r_lo, r_hi = bc.min(1), bc.max(1), br.min(1), br.max(1)
+        ids = feats.ids.tolist()
+        for i in range(len(feats)):
+            fid = str(ids[i])
+            if fid in seen:
+                continue
+            if specs[i] is None:
+                m = 4. / square + 2.
+                if (european and c_hi[i] >= -m and c_lo[i] <= w + m
+                        and r_hi[i] >= -m and r_lo[i] <= h + m):
+                    walk = europewalks.mapped_walk(feats, i)
+                    if walk is not None:
+                        seen.add(fid)
+                        for ring in roadsmod.ground_parts(feats, i):
+                            c, r = to_px(ring[:, 0], ring[:, 1])
+                            add(footpaths, c, r, walk.width / 2 + .15)
+                continue
+            seen.add(fid)
+            # (all of it off the grid, with room for everything drawn beside it: no sample of it is painted)
+            m = (specs[i].width + 2 * AISLE_STALLS_M + 2 * (specs[i].walk + square) + 2 * VERGE_M
+                 + 3 * roadsmod.median_width(specs[i])) / square + 4
+            if not (c_hi[i] >= -m and c_lo[i] <= w + m and r_hi[i] >= -m and r_lo[i] <= h + m):
+                continue
+            aisle = specs[i].kind == "paved" and \
+                roadsmod._rule_value(feats.rules.get("subclass"), i) == "parking_aisle"
+            mw = roadsmod.median_width(specs[i])
+            ms = roadsmod.median_side(specs[i])
+            for ring in (roadsmod.quick_ground_parts if quick else roadsmod.ground_parts)(feats, i):   # not bridges / tunnels
+                if pfr is not None:
+                    ring = placement.ring(pfr, feats, i, ring, specs[i], fid)
+                line(ring[:, 0], ring[:, 1], specs[i], aisle,
+                     () if quick else roadsmod.joint_desc(copies.get(fid, [(feats, i)]), taper_of))
+                if ms is not None and mw > roadsmod.MEDIAN_SLAB_M and len(ring) >= 2:
+                    # the median's ground: lawn (report #48, Boston Street, 2026-10-17)
+                    sc = np.array([111320.0 * dmath.cos(math.radians(float(ring[0, 1]))), 110540.0])
+                    xy = (ring[:, :2] - ring[0, :2]) * sc
+                    off = roadsmod.offset_polyline(np.c_[xy, np.zeros(len(xy))],
+                                                   ms * (specs[i].width / 2 + mw / 2))[:, :2] / sc + ring[0, :2]
+                    c, r = to_px(off[:, 0], off[:, 1])
+                    add(lawn, np.asarray(c, np.float64), np.asarray(r, np.float64), mw / 2)
+    for la, lo, spec in extra:
+        line(np.asarray(lo), np.asarray(la), spec, False)
+    # ramp gores, paved (gore_fills, in a frame at the grid's middle)
+    import geodesy
+    gfr = geodesy.EnuFrame(la_c, lo_c)
+    gb = gfr.geodetic_to_enu(np.array([float(np.min(lat)), float(np.max(lat))]),
+                             np.array([float(np.min(lon)), float(np.max(lon))]), np.zeros(2))
+    for hw_, mid in gore_fills(gfr, feats_list, (float(np.min(gb[0])) - 300, float(np.min(gb[1])) - 300,
+                                                 float(np.max(gb[0])) + 300, float(np.max(gb[1])) + 300), urban_fn, widths,
+                               quick=quick):
+        gla, glo, _ = gfr.enu_to_geodetic(mid[:, 0], mid[:, 1], np.zeros(len(mid)))
+        c, r = to_px(np.asarray(glo), np.asarray(gla))
+        c, r = np.asarray(c, np.float64), np.asarray(r, np.float64)
+        sk = segs.setdefault("paved", ([], [])) if "paved" in segs else None
+        if sk is not None:
+            sk[0].append(np.stack([c[:-1], r[:-1], c[1:], r[1:]], axis=1))
+            sk[1].append(np.maximum(hw_[:-1], hw_[1:]) / square)
+    fast.require(91, "mask_segments")
+
+    def mask(dst):
+        m = np.zeros((h, w), bool)
+        if dst[0]:
+            fast._ef.mask_segments(m, np.ascontiguousarray(np.concatenate(dst[0])), np.concatenate(dst[1]))
+        return m
+
+    out = idx.copy()
+    out[mask(lawn)] = LAWN
+    # roundabout footprints: lawn under the grass photo fill (photo_roads), so tyres feel grass not asphalt scar
+    for lonlat in _island_lonlat_rings(feats_list, urban_fn, widths, lat0=la_c, lon0=lo_c, lat=lat, lon=lon,
+                                       quick=quick):
+        c, r = to_px(lonlat[:, 0], lonlat[:, 1])
+        c, r = np.asarray(c, np.float64), np.asarray(r, np.float64)
+        if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+            continue
+        im = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(im).polygon(list(zip(c.tolist(), r.tolist())), fill=255)
+        out[np.asarray(im) > 0] = LAWN
+    v = mask(verge)
+    # the rounded corners of curbless junctions (roadcorners.py): asphalt as their roads (ROAD_EDGE_M past the arc), a
+    # verge round them
+    lonlat_bounds = (float(np.min(lon)), float(np.min(lat)), float(np.max(lon)), float(np.max(lat)))
+    # (quick: a stand-in block's paint, no corners: their rows wait on the lidar decisions, quick_ground_parts)
+    corner, corner_verge = (None, None) if quick else (
+        _corner_mask(feats_list, urban_fn, widths, lonlat_bounds, to_px, (h, w), grow)
+        for grow in (ROAD_EDGE_M, ROAD_EDGE_M + VERGE_M))
+    if corner_verge is not None:
+        v |= corner_verge
+    out[v & np.isin(out, VERGE_FROM)] = VERGE
+    if grass_verge[0]:
+        # Material layers drive BeamNG's stock GroundCover. Keep the strip green
+        # even on WorldCover's built-up village pixels, while roads and footways
+        # still win below.
+        out[mask(grass_verge) & np.isin(out, (GRASS, LAWN, DIRT))] = GRASS
+    if footpaths[0]:
+        out[mask(footpaths)] = ROAD_MATERIAL["paved"]
+    for k in ROAD_ORDER:
+        out[mask(segs[k])] = ROAD_MATERIAL[k]
+    if corner is not None:
+        out[corner] = ROAD_MATERIAL["paved"]
+    return out
+
+
+def _corner_mask(feats_list, urban_fn, widths, lonlat_bounds, to_px, shape, grow):
+    """The samples (bool (h, w), to_px: (lon, lat) -> (col, row)) inside the rounded corners of feats_list's junctions
+    (roadcorners.pads, their arcs grown by grow m), or None (none on the grid)."""
+    import roadcorners
+    pads = roadcorners.pads(feats_list, urban_fn, widths, lonlat_bounds=lonlat_bounds, grow=grow)
+    if not pads:
+        return None
+    h, w = shape
+    im = None
+    for la, lo in pads:
+        c, r = to_px(np.asarray(lo), np.asarray(la))
+        c, r = np.asarray(c, np.float64), np.asarray(r, np.float64)
+        if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+            continue
+        if im is None:
+            im = Image.new("L", (w, h), 0)
+            draw = ImageDraw.Draw(im)
+        draw.polygon(list(zip(c.tolist(), r.tolist())), fill=255)
+    return None if im is None else np.asarray(im) > 0
+
+
+# Roads in the ground (the user, 2026-10-22: "I dont love that we are applying a floating road texture over the normal
+# terrain"): by default (BNGE_ROADS_IN_GROUND=0 turns it off) the road tiles carry no carriageway mesh (roads.ROADS_IN_GROUND) and the
+# ground's photos have the carriageways painted in at their width (photo_roads): the drawn block's base photo and the
+# far tiles' textures down to PHOTO_ROADS_MAX_TEXEL (the near ring the block does not cover, where the meshes were);
+# the asphalt / cobble terrain layer (paint_roads) gives them their grain up close. Markings, curbs and sidewalks stay
+# meshes, and dirt and gravel roads keep a mesh of BeamNG's rutted road strip over this tint, fading into it at its
+# edges (roads.DIRT_LOOK, PR #455; BNE_DIRT_STRIPS=off: the tint alone).
+# colour and opacity by surface, blended in this order (paved last: it wins at junctions); a trace of the photo is kept
+# (stains, patches), and most of it on unpaved tracks, which the photo shows well and a flat colour drew as stripes
+# paved alpha 1.0 (was 0.92): an old through-road scar in the photo stayed visible as a dark E–W band across
+# roundabout approaches even after island grass fill (Chavagnes-en-Paillers 2026-10-28)
+# dirt 0.70 (was 0.45) and a darker earth brown: a farm track on pale fields (Suchy Dul, 2026-11-03) was barely
+# visible; the rest of the photo's own grain still shows through, so it does not read as a flat stripe
+# gravel: the light grey-beige gravel roads are from above (Iowa's NAIP ~200/200/195, Estonia's near white; the old
+# 128/118/102 at 0.6 drew them mid brown, 2026-11-03), less of it: the photo shows a gravel road well
+# (cobble: the setts' own mean colour, bne_cobble_b 135 132 127, a touch darker for the joints at a distance: the
+# drawn block's detail texture lies over this paint, and a darker brown showed the texture's 1 m-stepped edge as a tone
+# change, the user 2026-11-11: "the textures dont seem to match the border of the paint collor")
+# concrete (a paved road the map says is concrete: surface=concrete / concrete:plates / concrete:lanes): the pale grey
+# of a concrete motorway in the aerials (NAIP, 2026-11-12: I-405 at Sepulveda Pass luma 170-179, I-35E Dallas 162-184,
+# Houston's Katy Freeway 183-200, against Santa Monica Boulevard's asphalt 130-146)
+PHOTO_ROAD_RGBA = {"dirt": (112, 92, 68, 0.70), "gravel": (188, 182, 168, 0.5), "cobble": (128, 125, 120, 0.9),
+                   "concrete": (172, 170, 164, 1.0), "paved": (95, 95, 94, 1.0)}
+# The painted roads in the photo's own tone (earthfast.paint_lines_toned; the user, 2026-11-11: "look into other ways to
+# get the ground collor, and material to be right" -> "start with 1"): a kind's colour at a pixel is the mean of the
+# photo's pavement under it within PHOTO_TONE_RADIUS_M (markings over the sample luma, shadow under it, greenery and
+# saturated pixels, cars, left out), pulled to the kind's (luma min, luma max, saturation max), then `share` of it over
+# the flat PHOTO_ROAD_RGBA colour (fewer than `least` samples in the box: the flat colour). Old asphalt, patches and
+# concrete keep their shade; one road's tone is the same either side of a tile edge (the same photo pixels).
+PHOTO_TONE_RADIUS_M = 6.0
+PHOTO_TONE_SAMPLE_LUMA = (40.0, 185.0)
+PHOTO_TONE_SAMPLE_SAT = 0.30
+PHOTO_TONE_GREEN = 10.0
+# Concrete keeps its light tone (the user, 2026-11-12: "Concrete highways look too dark"): the paved cap (135) pulled a
+# concrete motorway's pale grey (luma 165-200 in NAIP, saturation 0.07-0.11) to asphalt's, and the sample cap (185)
+# left half its pixels out. A kind's tone row may carry (earthfast 231, roadtone.rs) its own sample cap and a light
+# pavement band: a tone from `light from` up, no more saturated than its saturation cap, keeps its luma up to the band's
+# cap (faded in over 20 luma below `light from` and out over half the saturation cap above it: no step along a road).
+# Paved: photo-detected concrete (and pale old asphalt) keeps its shade; a beige tone (sand, dry dirt under a road
+# drawn off its line: saturated) is held at the paved cap as before. Concrete (the map's tag): the photo's own tone
+# whatever it is (Phoenix's Papago Freeway, tagged concrete, wears a dark rubberised asphalt overlay: luma 86-134),
+# its light flat colour where the photo has none. The markings stay out at the higher sample cap: the second pass
+# keeps samples within 22 luma of the first pass's tone.
+PHOTO_ROAD_TONE = {"dirt": (70.0, 150.0, 0.45, 0.6, 12.0, 0.0, 0.0, 0.0, 0.0),
+                   "gravel": (110.0, 190.0, 0.30, 0.6, 12.0, 0.0, 0.0, 0.0, 0.0),
+                   "cobble": (80.0, 150.0, 0.22, 0.75, 12.0, 0.0, 0.0, 0.0, 0.0),
+                   "concrete": (70.0, 205.0, 0.12, 0.8, 12.0, 215.0, 0.0, 0.0, 0.0),
+                   "paved": (55.0, 135.0, 0.14, 0.75, 12.0, 215.0, 150.0, 205.0, 0.11)}
+PHOTO_ROADS_MAX_TEXEL = 2.0     # m per texel: coarser far tiles keep the photo's own roads (far, under a pixel wide)
+PHOTO_ROAD_EDGE_M = 0.2         # m the photo's asphalt reaches past the drawn edge, under the edge decal's inner sliver (its
+                                # antialiased rim left a pale hair between the edge line and the decal)
+
+
+def _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn=None, widths=None, roads_of=None):
+    """(segs (m, 4), half widths (m,), kind index into PHOTO_ROAD_RGBA (m,)) of the carriageways of feats_list in pixel
+    coordinates of a w x h photo over [x0, x0 + size] x [y0, y0 + size] (row 0 north), or None when none is in it:
+    each feature once (its first copy in the cells' order), its ground parts where the road tiles draw them
+    (roads.placement_context), tapered at its joints (roads.taper_widths, each joint's taper from its own cell:
+    roads.joint_desc), PHOTO_ROAD_EDGE_M wider each side, and the ramp gores' paved wedges (gore_fills), from the
+    cells' paint list (paintlist.py: made once per set of cells, cut to the square natively).
+    roads_of: a list that gets (each segment's road number, its road has no curb: roads.has_sidewalks)."""
+    import paintlist
+    got = paintlist.road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn, widths)
+    if got is None:
+        return None
+    segs, hws, kind, road, curbless = got
+    if roads_of is not None:
+        roads_of.append((road, curbless))
+    return segs, hws, kind
+
+
+_GORE_MEMO = OrderedDict()
+
+
+def gore_fills(frame, feats_list, box, urban_fn=None, widths=None, quick=False):
+    """[(half widths (k,), middle line (k, 3) in frame)] of the paved wedges between ramps and their motorways
+    (markings.gores) whose roads come near box (x0, y0, x1, y1) of frame. Kept for a few calls with the same features
+    and square (a block photo asks twice: unghost_square, paint_square)."""
+    key = (tuple(getattr(f, "__dict__", {}).get("_bnge_cell") or id(f) for f in feats_list), frame.lat0, frame.lon0,
+           tuple(round(float(v), 1) for v in box), quick)
+    got = _GORE_MEMO.get(key)
+    if got is None:
+        got = _gore_fills(frame, feats_list, box, urban_fn, widths, quick)
+        _GORE_MEMO[key] = got
+        while len(_GORE_MEMO) > 8:
+            _GORE_MEMO.popitem(last=False)
+    return got
+
+
+def _gore_fills(frame, feats_list, box, urban_fn=None, widths=None, quick=False):
+    import markings
+    near, seen = [], set()
+    placement = roadsmod.placement_context(feats_list, urban_fn, widths)   # (where the road tiles draw them)
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        specs = roadsmod.road_specs(feats, urban_fn, widths)
+        for i in range(len(feats)):
+            sp = specs[i]
+            fid = str(feats.ids[i])
+            if sp is None or fid in seen or not sp.oneway or sp.kind != "paved" or \
+                    (sp.cls not in markings.GORE_MAJOR and not sp.link):
+                continue
+            seen.add(fid)
+            for k, ring in enumerate(_ground_parts(quick)(feats, i)):
+                ring = placement.ring(frame, feats, i, ring, sp, fid)
+                e, n = mapgeom.enu_xy(feats, frame, ring)
+                if e.max() < box[0] or e.min() > box[2] or n.max() < box[1] or n.min() > box[3]:
+                    continue
+                near.append((f"{fid}:{k}", sp, np.c_[e, n, np.zeros(len(e))], 0.0))
+    return [(hw_, mid) for kind_, hw_, mid in (markings.gores(near) if near else ()) if kind_ == "fill" and len(mid) >= 2]
+
+
+def _feature_boxes(feats, frame):
+    """(n, 4) east min / max, north min / max of each feature's coordinates in frame (+-inf for none); kept with the
+    feats per frame, as their converted coordinates (mapgeom.Features.xy_in)."""
+    key = (frame.lat0, frame.lon0, frame.h0)
+    memo = feats.__dict__.setdefault("_boxes_in", {})
+    got = memo.get(key)
+    if got is not None:
+        return got
+    n = len(feats)
+    got = np.empty((n, 4))
+    got[:, 0::2], got[:, 1::2] = np.inf, -np.inf
+    a = feats.coord_off[feats.ring_off[feats.part_off[:-1]]]
+    b = feats.coord_off[feats.ring_off[feats.part_off[1:]]]
+    rows = np.flatnonzero(b > a)
+    if len(rows):
+        xy = feats.xy_in(frame)
+        for col, (u, f) in enumerate([(0, np.minimum), (0, np.maximum), (1, np.minimum), (1, np.maximum)]):
+            got[rows, col] = mapgeom._reduce(f, xy[:, u], a[rows], b[rows])
+    if len(memo) >= 2:
+        memo.pop(next(iter(memo)))
+    memo[key] = got
+    return got
+
+
+PHOTO_GHOST_M = 6.0     # m beside a curbless paved road where the photo's own pavement takes the ground beyond
+PHOTO_GHOST_TOL = 36.0  # RGB distance from the road's mean photo colour that counts as its pavement
+
+
+def photo_ghosts(rgb, frame, x0, y0, size, feats_list, urban_fn=None, widths=None):
+    """The photo rgb with its own pavement beside the drawn curbless paved roads (within PHOTO_GHOST_M of their edge,
+    coloured like the photo on the road) replaced by the ground beyond it, mirrored (earthfast.photo_ghosts), before
+    photo_roads paints the roads in: the map's carriageway is narrower than the photo's (its paved shoulders)
+    or a metre or two off it, and the photo's strip showed as a pale band beside one edge (Woodland Park, US-24: the
+    photo's pavement 17 m wide, the drawn road 11 m; the user, 2026-10-28). Pure (a new array)."""
+    h, w = rgb.shape[:2]
+    of = []
+    got = _road_segments(frame, x0, y0, size, w, h, feats_list, urban_fn, widths, roads_of=of)
+    if got is None:
+        return rgb
+    segs, hws, _ = got
+    road = np.concatenate([a for a, _ in of])
+    ghost = np.where(np.concatenate([b for _, b in of]), PHOTO_GHOST_M * w / size, 0.0)
+    if not ghost.any():
+        return rgb
+    fast.require(92, "photo_ghosts")
+    out, _ = fast._ef.photo_ghosts(np.ascontiguousarray(rgb, np.uint8), np.ascontiguousarray(segs, np.float64),
+                                   np.ascontiguousarray(hws, np.float64), np.ascontiguousarray(ghost, np.float64),
+                                   np.ascontiguousarray(road, np.int64), int(road.max()) + 1, PHOTO_GHOST_TOL)
+    return out
+
+
+# Roundabout island fill (Chavagnes-en-Paillers 2026-10-28): the photo often still shows the old through-road
+# across the grass and as a dark E–W band on the approaches; carriageway paint leaves gaps so the scar stays visible.
+ISLAND_GRASS = (76, 98, 58)     # muted grass when the photo's own greens are too few to sample
+ISLAND_LAWN = (86, 116, 54)     # a mown lawn's green: an island's photo fill is pulled this far (plan 038: the pale grey-green
+ISLAND_LAWN_SHARE = 0.55        # of Nachod's, stones and shrubs in the picture, read as sand under the engine's grass)
+# Outset past the ring centreline so the fill covers the whole roundabout footprint (island + carriageways); paint_lines
+# then redraws the asphalt on top and only the island centre stays grass.
+ISLAND_OUTSET_M = 8.0
+# ... only where the photo shows the island green: a footprint with less of its pixels green than this is a paved
+# circle (Baltimore's Washington Monument, a stone plaza round the column: 0.1 % green, drawn as a lawn; a grass
+# island's share of its footprint, the ring road included, is about 20-25 %)
+ISLAND_MIN_GREEN = 0.05
+
+
+def _outset_poly(xy, metres):
+    """xy (k, 2) scaled out from its centroid by metres along each radius (a roundabout footprint)."""
+    c = xy.mean(0)
+    d = xy - c
+    r = np.maximum(dnp.hypot(d[:, 0], d[:, 1]), 1e-3)
+    return c + d * ((r + metres) / r)[:, None]
+
+
+def _roundabout_footprints(roads_list):
+    """Metre polygons (k, 2) of each roundabout's full footprint (centreline loop outset by ISLAND_OUTSET_M)."""
+    import islands as islandsmod
+    out = []
+    for f in islandsmod.find(roads_list):
+        if not f.get("round"):
+            continue
+        # centreline loop (covers island + half the ring); outset reaches the outer verge so the ortho scar under
+        # the ring and the splitter noses is covered before carriageways paint back on top
+        xy = np.asarray(f["poly"], np.float64)[:, :2]
+        out.append(_outset_poly(xy, ISLAND_OUTSET_M))
+    return out
+
+
+# m round the painted area a road may lie and still be part of a roundabout reaching it (islands.MAX_AREA_M2: ~120 m
+# across, + ISLAND_OUTSET_M). Only those go to islands.find: all the roads of the cells round a photo square or a block
+# took ~125 ms a call in Fells Point, its painting of the roads themselves 3 ms (merge of PR #468, 2026-10-29)
+ISLAND_REACH_M = 150.0
+
+
+def _ground_parts(quick):
+    """roads.ground_parts, or for a stand-in block's paint roads.quick_ground_parts (no waits on the lidar)."""
+    return roadsmod.quick_ground_parts if quick else roadsmod.ground_parts
+
+
+def _roads_list_enu(frame, feats_list, urban_fn=None, widths=None, bounds=None, quick=False):
+    """islands.find roads_list from feats_list in frame ENU metres; bounds (x0, y0, x1, y1): only the roads with a
+    point within ISLAND_REACH_M of it."""
+    roads_list = []
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        specs = roadsmod.road_specs(feats, urban_fn, widths)
+        fb = None
+        if bounds is not None:
+            r = ISLAND_REACH_M
+            b = feats.boxes(frame)
+            fb = ((b[:, 2] >= bounds[0] - r) & (b[:, 0] <= bounds[2] + r)
+                  & (b[:, 3] >= bounds[1] - r) & (b[:, 1] <= bounds[3] + r))
+        for i in range(len(feats)):
+            sp = specs[i]
+            if sp is None or (fb is not None and not fb[i]):
+                continue
+            for ring in _ground_parts(quick)(feats, i):
+                e, n = mapgeom.enu_xy(feats, frame, ring)
+                if len(e) < 2:
+                    continue
+                roads_list.append((str(feats.ids[i]), sp,
+                                   np.column_stack([e, n, np.zeros(len(e))]), float(ring[0, 0])))
+    return roads_list
+
+
+def _island_lonlat_rings(feats_list, urban_fn=None, widths=None, lat0=None, lon0=None, lat=None, lon=None,
+                         quick=False):
+    """Lon/lat polygons of roundabout footprints among feats_list (for paint_roads lawn); lat / lon (the painted
+    samples): only the roundabouts that can reach them (_roads_list_enu bounds)."""
+    import geodesy
+    if lat0 is None or lon0 is None:
+        for feats in feats_list:
+            if feats is None or len(feats) == 0:
+                continue
+            specs = roadsmod.road_specs(feats, urban_fn, widths)
+            for i in range(len(feats)):
+                if specs[i] is None:
+                    continue
+                for ring in _ground_parts(quick)(feats, i):
+                    if len(ring) >= 2:
+                        lon0, lat0 = float(ring[0, 0]), float(ring[0, 1])
+                        break
+                if lat0 is not None:
+                    break
+            if lat0 is not None:
+                break
+    if lat0 is None:
+        return []
+    frame = geodesy.EnuFrame(float(lat0), float(lon0), 0.0)
+    bounds = None
+    if lat is not None and lon is not None and np.size(lat):
+        la_, lo_ = np.asarray(lat, np.float64).ravel(), np.asarray(lon, np.float64).ravel()
+        cla = np.array([la_.min(), la_.min(), la_.max(), la_.max()])
+        clo = np.array([lo_.min(), lo_.max(), lo_.min(), lo_.max()])
+        e, n, _ = frame.geodetic_to_enu(cla, clo, np.zeros(4))
+        bounds = (float(np.min(e)), float(np.min(n)), float(np.max(e)), float(np.max(n)))
+    out = []
+    for xy in _roundabout_footprints(_roads_list_enu(frame, feats_list, urban_fn, widths, bounds, quick)):
+        la, lo, _ = frame.enu_to_geodetic(xy[:, 0], xy[:, 1], np.zeros(len(xy)))
+        out.append(np.column_stack([np.asarray(lo, np.float64), np.asarray(la, np.float64)]))
+    return out
+
+
+def _fill_island_photos(rgb, polys):
+    """rgb with each roundabout footprint (pixel polygons, row 0 north) filled: the median of its greener photo pixels
+    (LAWN_GREEN) pulled ISLAND_LAWN_SHARE toward ISLAND_LAWN, else ISLAND_GRASS. Covers the old through-road scar;
+    carriageways paint over the ring afterwards. A footprint the photo shows paved (under ISLAND_MIN_GREEN of it green)
+    is left as it is. (photo_roads' island step, earthfast paint_photo's, on pixel polygons: a square of the photo's
+    width.)"""
+    if not polys:
+        return rgb
+    import paintlist
+    rgb = np.ascontiguousarray(rgb, np.uint8)
+    w = rgb.shape[1]
+    rings = [np.c_[np.asarray(p, np.float64)[:, 0], w - np.asarray(p, np.float64)[:, 1]] for p in polys if len(p)]
+    return fast._ef.paint_photo(rgb, 0.0, 0.0, float(w), paintlist.style(), islands=paintlist._polys(rings),
+                                has_roads=True)
+
+
+def photo_roads(rgb, frame, x0, y0, size, feats_list, urban_fn=None, widths=None, simple=False):
+    """The photo rgb (H x W x 3, row 0 = north, covering [x0, x0 + size] x [y0, y0 + size] of frame) with the
+    carriageways of feats_list (road Features: roads.road_specs widths, ground parts only) painted in, antialiased, in
+    the photo's own tone (PHOTO_ROAD_RGBA, PHOTO_ROAD_TONE). Roundabout footprints are filled with grass first so the
+    photo's old through-road scar does not show (_fill_island_photos); carriageways paint over the ring, then the
+    rounded corners (roadcorners.py: curbless junctions and the curb returns' fills) in the tone of the painted road
+    around each (the paint's corner follows the curb's arc). simple: the carriageways alone (a stand-in photo, shown a
+    second or two at speed: the junctions' corners were 1.3 s of its 2 s). Pure (a new array): paintlist.py, one
+    native call (earthfast paint_photo) from the cells' paint lists."""
+    import paintlist
+    return paintlist.paint(rgb, frame, x0, y0, size, feats_list, (), urban_fn, widths, simple=simple, steps={"roads"})
+
+
+def corner_pads(frame, x0, y0, size, feats_list, urban_fn=None, widths=None):
+    """The rounded corners (roadcorners.pads: curbless; roadcorners.curb_pads: the curb returns' fills) that may reach a
+    photo square [x0, x0 + size]² of frame, their arcs grown by PHOTO_ROAD_EDGE_M as the roads' paint (a few metres of
+    margin: the bounds are rounded out anyway)."""
+    import roadcorners
+    if not feats_list:
+        return []
+    bounds = (x0 - 4.0, y0 - 4.0, x0 + size + 4.0, y0 + size + 4.0)
+    return (roadcorners.pads(feats_list, urban_fn, widths, frame, bounds=bounds, grow=PHOTO_ROAD_EDGE_M)
+            + roadcorners.curb_pads(feats_list, urban_fn, widths, frame, bounds=bounds, grow=PHOTO_ROAD_EDGE_M))
+
+
+PHOTO_ROADS_PENDING = ("surface_roads",)
+
+
+def _square_roads(frame, x0, y0, size, surface, pending=None):
+    """The road Features of surface's cached cells around [x0, x0 + size]² of frame (never waits)."""
+    la, lo = _square_pts(frame, x0, y0, size)
+    feats, complete = surface.roads(la, lo)
+    if not complete and pending is not None:
+        # (PR #505: a photo painted before its roads' cells were cached is rendered again once they are,
+        # earthd.Server.base_ready. Everywhere, not only with the European road details on: without it a block's
+        # photo made on a fast first visit kept the raw aerial over its roads for good, the forest canopy over a
+        # mountain road read as grass and gravel once the stand-in's painted asphalt was swapped out (Discord
+        # 2026-10-26 .. 11-12: "90% of mountain roads in japan are just 100% gravel/grass", Myanmar, China, the
+        # Pacific Northwest; "it changes the entire road, even the parts that were asphalt"))
+        pending.add(PHOTO_ROADS_PENDING)
+    return feats
+
+
+def enlarge(rgb, px):
+    """The photo rgb (h x w x 3 uint8) at px x px (a plain bilinear resize; as it was at that size already), so what
+    is painted into it after (roads, pads, rock) is drawn at the finer texel."""
+    rgb = np.asarray(rgb, np.uint8)
+    if rgb.shape[0] == px and rgb.shape[1] == px:
+        return rgb
+    return np.asarray(Image.fromarray(rgb, "RGB").resize((px, px), Image.BILINEAR), np.uint8)
+
+
+def _square_pts(frame, x0, y0, size):
+    gx = x0 + np.array([0.0, size, 0.0, size, size / 2])
+    gy = y0 + np.array([0.0, 0.0, size, size, size / 2])
+    la, lo, _ = frame.enu_to_geodetic(gx, gy, np.zeros(5))
+    return np.asarray(la), np.asarray(lo)
+
+
+def _square_lots(frame, x0, y0, size, surface):
+    """The infrastructure and land-use Features around a photo square (Surface.lots; never waits)."""
+    if surface is None or not hasattr(surface, "lots"):
+        return []
+    la, lo = _square_pts(frame, x0, y0, size)
+    return surface.lots(la, lo)
+
+
+# Golf playing surfaces (Overture land_use class, subtype golf: OSM golf=*). Painted under the roads and the
+# lots, so a cart path and a car park keep their own surface. Tees and a driving range use the fairway texture.
+# A class that is not a golf subtype (a military bunker) is left alone. These materials are absent from
+# groundcover.lua, so no 3D grass grows on them.
+GOLF_ROUGH_CLASSES = ("rough",)
+GOLF_FAIRWAY_CLASSES = ("fairway", "tee", "driving_range")
+GOLF_GREEN_CLASSES = ("green",)
+GOLF_BUNKER_CLASSES = ("bunker",)
+GOLF_SUBTYPES = ("", "golf")
+GOLF_LAYERS = (
+    (GOLF_ROUGH_CLASSES, GOLF_ROUGH),
+    (GOLF_FAIRWAY_CLASSES, GOLF_FAIRWAY),
+    (GOLF_GREEN_CLASSES, GOLF_GREEN),
+    (GOLF_BUNKER_CLASSES, GOLF_BUNKER),
+)
+# (r, g, b, opacity) painted into the ground photo, mesh mode's visible ground. Later rows cover earlier ones.
+GOLF_PHOTO = (
+    (GOLF_ROUGH_CLASSES, (70, 104, 48, 0.70)),
+    (GOLF_FAIRWAY_CLASSES, (78, 102, 64, 0.42)),
+    (GOLF_GREEN_CLASSES, (68, 112, 70, 0.48)),
+    (GOLF_BUNKER_CLASSES, (214, 196, 148, 0.94)),
+)
+
+
+def _text_col(feats, name):
+    """Attribute `name` as lower-case strings, or None when the column is absent."""
+    a = feats.attrs.get(name)
+    if a is None:
+        return None
+    return np.array([str(v or "").strip().lower() for v in a], dtype=object)
+
+
+def _golf_mask(feats, classes):
+    """True for polygons of these land-use classes whose subtype is golf (or unset)."""
+    cls = _text_col(feats, "class")
+    if cls is None:
+        return None
+    sub = _text_col(feats, "subtype")
+    if sub is None:
+        sub = np.full(len(cls), "", dtype=object)
+    return np.isin(cls, classes) & np.isin(sub, GOLF_SUBTYPES)
+
+
+def _golf_rings(feats_list, classes):
+    """Outer rings (lon, lat) of the golf polygons of these classes."""
+    rings = []
+    for feats in feats_list or ():
+        if feats is None or len(feats) == 0:
+            continue
+        sel = _golf_mask(feats, classes)
+        if sel is None:
+            continue
+        for i in np.flatnonzero(sel & (np.asarray(feats.kind) == 3)):
+            for part in feats.parts(int(i)):
+                if not part or len(part[0]) < 3:
+                    continue
+                rings.append(np.asarray(part[0], np.float64))
+    return rings
+
+
+def paint_golf(idx, lat, lon, feats_list):
+    """idx with rough, then fairway (tees and the driving range too), then greens, then bunkers.
+    A later layer covers an earlier one. Pure."""
+    cols = {}                           # (each Features' class / subtype read once, not per layer: every block)
+
+    def mask(feats, classes):
+        k = id(feats)
+        if k not in cols:
+            cls = _text_col(feats, "class")
+            sub = _text_col(feats, "subtype") if cls is not None else None
+            golf = None if cls is None else np.isin(cls, sum((c for c, _ in GOLF_LAYERS), ())) & (
+                np.isin(sub, GOLF_SUBTYPES) if sub is not None else True)
+            cols[k] = (cls, golf)
+        cls, golf = cols[k]
+        if cls is None or not golf.any():
+            return None
+        return golf & np.isin(cls, classes)
+
+    for classes, material in GOLF_LAYERS:
+        idx = _paint(idx, lat, lon, feats_list, lambda feats, c=classes: mask(feats, c), material)
+    return idx
+
+
+def photo_golf(rgb, frame, x0, y0, size, feats_list):
+    """The photo with golf surfaces tinted (GOLF_PHOTO: each layer's polygons drawn as PIL's, blended at its opacity),
+    under the lots and the carriageways. Pure: rgb is not changed (paintlist.py: earthfast paint_photo's golf)."""
+    if rgb is None or size <= 0 or not feats_list:
+        return rgb
+    h, w = rgb.shape[:2]
+    if h == 0 or w == 0:
+        return rgb
+    import paintlist
+    return paintlist.paint(rgb, frame, x0, y0, size, (), feats_list, steps={"golf"})
+
+
+@profile_step('Photo road paint')
+def paint_square(rgb, frame, x0, y0, size, surface, widths=None, simple=False, pending=None, pads=None):
+    """photo_roads for a ground photo over [x0, x0 + size]² of frame with the roads of surface's cached cells (a
+    Surface; never waits); as it was when its texels are coarser than PHOTO_ROADS_MAX_TEXEL or no cell is cached.
+    Crop rows are painted first (photo_fields: dirt furrows, the photo left between them; a dirt road is left bare,
+    since its paint is translucent), golf surfaces (photo_golf), then parking lots, gas-station pads, then the
+    carriageways over them: in one native call from the cells' paint lists (paintlist.py, earthfast 295), made once
+    per set of cells, not again for every square.
+    simple: the carriageways alone (a stand-in photo). pads: the gas station pads [(lat, lon)] (the server's, handed
+    to a far-tile process with the square); None: the surface's own (_square_pads)."""
+    if surface is None or size / max(rgb.shape[1], 1) > PHOTO_ROADS_MAX_TEXEL:
+        return rgb
+    import paintlist
+    roads = _square_roads(frame, x0, y0, size, surface, pending)
+    lots = []
+    if not simple:          # (simple, a stand-in's: the carriageways alone, photo_roads)
+        lots = _square_lots(frame, x0, y0, size, surface)
+        if pads is None:
+            pads = _square_pads(frame, x0, y0, size, surface)
+    if simple and not roads:
+        return rgb
+    return paintlist.paint(rgb, frame, x0, y0, size, roads, lots, getattr(surface, "urban", None), widths,
+                           pads or (), simple=simple)
+
+
+def unghost_square(rgb, frame, x0, y0, size, surface, widths=None):
+    """photo_ghosts for a ground photo over [x0, x0 + size]² of frame with the roads of surface's cached cells (never
+    waits; as paint_square), at the photo's own resolution, before it is enlarged and the roads painted in."""
+    if surface is None or size / max(rgb.shape[1], 1) > PHOTO_ROADS_MAX_TEXEL:
+        return rgb
+    feats = _square_roads(frame, x0, y0, size, surface)
+    if not feats:
+        return rgb
+    return photo_ghosts(rgb, frame, x0, y0, size, feats, surface.urban, widths)
+
+
+def _square_pads(frame, x0, y0, size, surface):
+    """The gas station pads (Surface.fuel_pads) of the cells around [x0, x0 + size]² of frame (never waits)."""
+    if not (getattr(surface, "gas_pads", False) or getattr(surface, "bus_pads", False)) \
+            and getattr(surface, "extra_pads", None) is None:
+        return []
+    gx = x0 + np.array([0.0, size, 0.0, size, size / 2])
+    gy = y0 + np.array([0.0, 0.0, size, size, size / 2])
+    la, lo, _ = frame.enu_to_geodetic(gx, gy, np.zeros(5))
+    return surface.fuel_pads(np.asarray(la), np.asarray(lo))
+
+
+# The near tiles' asphalt (mesh near-visual mode, where the tiles are the ground seen): a mask of the built
+# carriageways (paved, cobble) beside the tile's texture, far_<a>_<key>_road.dds (road_mask_name), finer than the photo
+# (farfield.NEAR_MASK_PX; the GPU has room, the CPU less, the user 2026-10-22); the mod's material gives the masked
+# part a second layer of the stock asphalt (its colour, grain and bumps, world-locked; satmat.lua), the rest the photo.
+ROAD_MASK_MAX_TEXEL = 1.0       # m per texel of the mask
+ROAD_MASK_KINDS = ("paved", "cobble", "concrete")
+
+
+def road_mask_name(texture):
+    """The road mask file beside a far tile's texture (far_<a>_<key>[_r<n>].dds -> far_<a>_<key>_road.dds)."""
+    import re
+    return re.sub(r"(_r\d+)?\.dds$", "_road.dds", texture)
+
+
+def road_mask(frame, x0, y0, size, px, surface, widths=None):
+    """The built carriageways' coverage (px x px uint8, 255 on the road, antialiased) of a tile photo's square
+    [x0, x0 + size]² (its gutter included: the mask lines up with it on UV0), or None (texels coarser than
+    ROAD_MASK_MAX_TEXEL, no roads, no cell cached)."""
+    if surface is None or size / max(px, 1) > ROAD_MASK_MAX_TEXEL:
+        return None
+    pads = pads_mask(frame, x0, y0, size, px, _square_pads(frame, x0, y0, size, surface))
+    lots = lots_mask(frame, x0, y0, size, px, _square_lots(frame, x0, y0, size, surface))
+    feats = _square_roads(frame, x0, y0, size, surface)
+    got = _road_segments(frame, x0, y0, size, px, px, feats, surface.urban, widths) if feats else None
+    corners = corners_mask(frame, x0, y0, size, px, corner_pads(frame, x0, y0, size, feats, surface.urban, widths)) \
+        if feats else None
+    out = None
+    if got is not None:
+        colors = np.array([(255.0, 255.0, 255.0, 1.0 if k in ROAD_MASK_KINDS else 0.0) for k in PHOTO_ROAD_RGBA],
+                          np.float32)
+        out = fast._ef.paint_lines(np.zeros((px, px, 3), np.uint8), *got, colors)[..., 0]
+    for extra in (pads, lots, corners):
+        if extra is not None:
+            out = extra if out is None else np.maximum(out, extra)
+    return None if out is None or not out.any() else out
+
+
+# A road without sidewalks gets a verge of VERGE_M a side painted bare where the ground would carry grass or shrubs:
+# the ground cover goes by the layer samples (2 m then, 1 m since 2026-11-01), and tufts stood on the asphalt along its
+# edges in many places (the user, 2026-10-20: "grass on the road")
+VERGE_M = 1.0 + 0.5 * heightmap.SQUARE     # (1.5 m at 1 m squares, 2 m at 2 m)
+VERGE_FROM = (GRASS, LAWN, DUSTY)
+VERGE = DIRT
+AISLE_STALLS_M = 5.5        # a parking aisle's stall rows (parking.LOT_SPOT_D_M), painted with it
+PARKING_CLASSES = {"parking"}     # Overture infrastructure (transit) polygons drawn as asphalt: no grass on a lot
+# Squares and pedestrian areas (Overture land_use subtype "pedestrian": Mexico City's Zocalo read as bare dirt,
+# 2026-10-15): paving, under the parking lots and the roads drawn over them
+PLAZA_CLASSES = {"pedestrian", "plaza"}
+# Substations' yards (Overture infrastructure class substation; powerlines.py fills them with switchgear): crushed
+# stone, as West Coast USA's yard (the gravel layer), 2026-10-26
+YARD_CLASSES = {"substation"}
+# Crop rows (Overture land_use class farmland). The physics is one dirt polygon — a striped 2 m grid would rumble —
+# and the photo draws the furrows (photo_fields), under the lots and the carriageways.
+FARM_CLASSES = {"farmland"}
+FARM_ROW_M = 4.0            # metres from one furrow to the next, across the field's long axis
+FARM_FURROW_M = 2.3
+FARM_SOIL = (92.0, 68.0, 42.0)
+FARM_MIX = 0.62             # how far a furrow pixel moves from the photo toward bare soil
+FARM_ROAD_CLEAR_M = 4.0     # furrows stop this far short of a dirt road's edge
+
+
+def paint_fields(idx, lat, lon, feats_list):
+    """idx with farmland polygons drawn as dirt (the whole field: the furrows are only in the photo). Pure."""
+    return _paint(idx, lat, lon, feats_list, _farmland, DIRT)
+
+
+def paint_grass(idx, lat, lon, feats_list):
+    """Mapped lawns and grassy areas before roads, paved lots and footways."""
+    import europewalks
+
+    if not europewalks.enabled() or europewalks.country_for(float(lon[lon.shape[0] // 2, lon.shape[1] // 2]),
+                                                          float(lat[lat.shape[0] // 2, lat.shape[1] // 2])) is None:
+        return idx
+
+    def select(feats):
+        cls = feats.attrs.get("class")
+        mat = feats.attrs.get("surface")
+        grass = np.isin(cls, ("grass", "grassland", "meadow", "village_green", "lawn")) if cls is not None else False
+        return grass | np.isin(mat, ("grass", "grass_paver")) if mat is not None else grass
+
+    grass = _paint(idx, lat, lon, feats_list, select, GRASS)
+    if grass is not idx:
+        keep = np.isin(idx, (MUD, ROCK, SNOW))
+        grass[keep] = idx[keep]
+    return grass
+
+
+def paint_lots(idx, lat, lon, feats_list, us_looks=None):
+    """idx with the squares and pedestrian areas (land_use polygons of subtype "pedestrian") of feats_list painted
+    (paint_plazas), then the parking lots (polygons of class "parking") as asphalt (Lancaster County's photos: the
+    grass layer's ground cover grew on lots), the substations' yards as gravel. Pure given us_looks."""
+    idx = paint_plazas(idx, lat, lon, feats_list, us_looks)
+    idx = _paint(idx, lat, lon, feats_list, _yards, LOOSE)
+    return _paint(idx, lat, lon, feats_list, _parking, ASPHALT)
+
+
+# The squares' layers by their look (plazas.paving's material): asphalt and concrete the asphalt layer, flat-topped
+# pavers and red brick their own (in detail mode the block draws them: the squares' mesh is the mesh mode's), setts and
+# cobbles the cobble layer
+PLAZA_LAYER = {"road_asphalt_2lane": ASPHALT, "italy_cobblestone": COBBLE, "italy_sidewalk_tiles": PAVERS,
+               "bne_sidewalk_brick": BRICK}
+
+
+def paint_plazas(idx, lat, lon, feats_list, us_looks=None):
+    """idx with the squares and pedestrian areas of feats_list painted by their mapped surface (plazas.paving,
+    PLAZA_LAYER; a square's own paving material / colour tags first: plazas.tag_look), their holes (a fountain, a
+    lawn) left as they were, a smaller square over a larger one; unpaved
+    ones (sand, gravel, grass) left to the land cover. A US square mapped paving_stones or nothing: us_looks(outer
+    rings lon/lat) -> looks (plazas.us_looks: red brick where the photo shows it), None: plazas.US_UNREAD_BRICK's.
+    Pure given us_looks."""
+    import plazas
+    import streetfront
+    h, w = idx.shape
+    to_px = grid_affine(lat, lon)
+    items = []                          # (area px, outer ring lon/lat, holes, look)
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        sel = _plazas(feats)
+        if sel is None:
+            continue
+        sf = feats.attrs.get("surface")
+        for i in np.flatnonzero(sel & (feats.kind == 3)):
+            sv = str(sf[i]).strip().lower() if sf is not None and sf[i] is not None else ""
+            for part in feats.parts(i):
+                if not part or len(part[0]) < 3:
+                    continue
+                ring = np.asarray(part[0], np.float64)
+                c, r = to_px(ring[:, 0], ring[:, 1])
+                if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+                    continue
+                look = plazas.paving(sv or None, float(ring[:, 1].mean()), float(ring[:, 0].mean()))
+                if look is None:
+                    continue
+                if look == plazas.US_AMBIGUOUS or sv in ("paving_stones", ""):    # (its own tags first: tag_look)
+                    look = plazas.tag_look(streetfront.tags_of(feats, i)) or look
+                area = 0.5 * abs(float(dnp.dot(c, np.roll(r, 1)) - dnp.dot(r, np.roll(c, 1))))
+                items.append((area, ring, part[1:], look))
+    if not items:
+        return idx
+    amb = [k for k, it in enumerate(items) if it[3] == plazas.US_AMBIGUOUS]
+    if amb:
+        looks = us_looks([items[k][1] for k in amb]) if us_looks is not None else None
+        for j, k in enumerate(amb):
+            look = looks[j] if looks is not None and j < len(looks) else plazas.us_looks([None], None)[0]
+            items[k] = items[k][:3] + (look,)
+    im = Image.new("L", (w, h), 255)    # (255: not a square)
+    draw = ImageDraw.Draw(im)
+    for _, ring, holes, look in sorted(items, key=lambda it: -it[0]):     # (the larger first: a smaller one over it)
+        c, r = to_px(ring[:, 0], ring[:, 1])
+        draw.polygon(list(zip(c.tolist(), r.tolist())), fill=int(PLAZA_LAYER.get(look[0], ASPHALT)))
+        for hole in holes:
+            hole = np.asarray(hole, np.float64)
+            if len(hole) >= 3:
+                hc, hr = to_px(hole[:, 0], hole[:, 1])
+                draw.polygon(list(zip(hc.tolist(), hr.tolist())), fill=255)
+    lay = np.asarray(im)
+    if (lay == 255).all():
+        return idx
+    out = idx.copy()
+    m = lay != 255
+    out[m] = lay[m]
+    return out
+
+
+# Gas station forecourts (gasstations.forecourt_pad: Surface.fuel_pads, from the road tiles), asphalt in the ground
+# models, the photo (the paved roads' colour, under the roads) and the near tiles' asphalt mask
+FUEL_PAD_STATIONS = 4096        # stations' pads kept (a few small rings each)
+FRONTAGE_PAD_TILES = 512
+FRONTAGE_PAD_PREFIX = "frontage:"
+FRONTAGE_GRASS_PREFIX = FRONTAGE_PAD_PREFIX + "grass:"
+
+
+def paint_pads(idx, lat, lon, pads):
+    """idx with the pads [(lat (k,), lon (k,))] drawn in as asphalt. Pure."""
+    if not pads:
+        return idx
+    h, w = idx.shape
+    to_px = grid_affine(lat, lon)
+    im = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(im)
+    for la, lo in pads:
+        c, r = to_px(np.asarray(lo), np.asarray(la))
+        if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+            continue
+        draw.polygon(list(zip(c.tolist(), r.tolist())), fill=255)
+    out = idx.copy()
+    out[np.asarray(im) > 0] = ASPHALT
+    return out
+
+
+def paint_frontage_pads(idx, lat, lon, pads, material=ASPHALT):
+    """Select the terrain squares whose centres are inside an apron or a photographed lawn."""
+    import polygon
+
+    if not pads:
+        return idx
+    h, w = idx.shape
+    to_px = grid_affine(lat, lon)
+    out = idx.copy()
+    for la, lo in pads:
+        xy = np.column_stack(to_px(lo, la)) - .5
+        x0, y0 = np.maximum(np.ceil(xy.min(axis=0)).astype(int), [0, 0])
+        x1, y1 = np.minimum(np.floor(xy.max(axis=0)).astype(int), [w - 1, h - 1])
+        if x0 > x1 or y0 > y1:
+            continue
+        y, x = np.mgrid[y0:y1 + 1, x0:x1 + 1]
+        hit = polygon.contains_points(xy, np.c_[x.ravel(), y.ravel()])
+        y, x = y.ravel()[hit], x.ravel()[hit]
+        if material == GRASS:
+            keep = np.isin(out[y, x], (DIRT, LAWN, DUSTY))
+            y, x = y[keep], x[keep]
+        out[y, x] = material
+    return out
+
+
+def _pads_photo_px(frame, x0, y0, size, w, h, pads):
+    """The pads as (cols, rows) rings in a w x h photo over [x0, x0 + size]² of frame (row 0 north): those that reach
+    into it."""
+    out = []
+    for la, lo in pads:
+        e, n, _ = frame.geodetic_to_enu(np.asarray(la), np.asarray(lo), np.zeros(len(la)))
+        c = (np.asarray(e, np.float64) - x0) * (w / size)
+        r = (y0 + size - np.asarray(n, np.float64)) * (h / size)
+        if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+            continue
+        out.append((np.ascontiguousarray(c), np.ascontiguousarray(r)))
+    return out
+
+
+def _pads_px(frame, x0, y0, size, w, h, pads):
+    """A w x h coverage (float 0..1: the share of each pixel's 2 x 2 sub-pixel centres inside a pad) of the pads in a
+    photo over [x0, x0 + size]² of frame (row 0 north), or None when none is in it (earthfast.pad_cover: PIL drew
+    the whole 2x image over the lots' common box, most of a 4096 px block photo, 1.1 s of its 1.5 s of roads,
+    2026-11-01)."""
+    polys = _pads_photo_px(frame, x0, y0, size, w, h, pads) if pads else []
+    if not polys:
+        return None
+    fast.require(140, "pad coverage")
+    cov = fast._ef.pad_cover(int(h), int(w), polys)
+    return None if cov is None else cov.astype(np.float32) / 4.0
+
+
+def _windows_px(frame, x0, y0, size, w, h, pads):
+    """Each pad's coverage in a w x h photo over [x0, x0 + size]² of frame (row 0 north) in its own small window: [(r0,
+    c0, coverage (float 0..1, 2x supersampled edges))]. (The rounded corners lie all over a photo: one image over their
+    common box was the whole photo, 0.15 s a 2048 px square.)"""
+    k = 2
+    px_m = w * k / size
+    out = []
+    for la, lo in pads:
+        e, n, _ = frame.geodetic_to_enu(np.asarray(la), np.asarray(lo), np.zeros(len(la)))
+        c = (np.asarray(e) - x0) * px_m
+        r = (y0 + size - np.asarray(n)) * px_m
+        c0 = max(0, int(c.min()) // k * k)
+        r0 = max(0, int(r.min()) // k * k)
+        c1 = min(w * k, -(-int(c.max() + 1) // k) * k)
+        r1 = min(h * k, -(-int(r.max() + 1) // k) * k)
+        if c1 <= c0 or r1 <= r0:
+            continue
+        im = Image.new("L", (c1 - c0, r1 - r0), 0)
+        ImageDraw.Draw(im).polygon(list(zip((c - c0).tolist(), (r - r0).tolist())), fill=255)
+        sub = np.asarray(im, np.float32).reshape((r1 - r0) // k, k, (c1 - c0) // k, k).mean(axis=(1, 3)) / 255.0
+        out.append((r0 // k, c0 // k, sub))
+    return out
+
+
+def corners_mask(frame, x0, y0, size, px, pads):
+    """pads_mask for the rounded junction corners (each in its own window): px x px uint8, or None."""
+    out = None
+    for r0, c0, a in _windows_px(frame, x0, y0, size, px, px, pads):
+        if out is None:
+            out = np.zeros((px, px), np.uint8)
+        r1, c1 = r0 + a.shape[0], c0 + a.shape[1]
+        out[r0:r1, c0:c1] = np.maximum(out[r0:r1, c0:c1], np.round(a * 255.0).astype(np.uint8))
+    return out
+
+
+def photo_pads(rgb, frame, x0, y0, size, pads):
+    """The photo rgb (H x W x 3, row 0 north, over [x0, x0 + size]² of frame) with the pads painted as the paved roads
+    (PHOTO_ROAD_RGBA, their 2 x 2 sub-pixel coverage, in the photo's own pavement tone under them: earthfast's
+    paint_cover_toned toning, PHOTO_ROAD_TONE; the user, 2026-11-11: "utiluze and revfine this method of texturing the
+    ground more"). Pure (paintlist.py: earthfast paint_photo's pads)."""
+    if not pads:
+        return rgb
+    import paintlist
+    return paintlist.paint(rgb, frame, x0, y0, size, (), (), pads=pads, steps={"pads"})
+
+
+def pads_mask(frame, x0, y0, size, px, pads):
+    """The pads' coverage (px x px uint8, 255 inside) of a tile photo's square, or None (none in it)."""
+    a = _pads_px(frame, x0, y0, size, px, px, pads)
+    return None if a is None else np.round(a * 255.0).astype(np.uint8)
+
+
+def lot_pads(feats_list):
+    """Parking-lot outer rings as (lat, lon) pads for the photo painters (class parking, not grass or gravel)."""
+    pads = []
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        sel = _parking(feats)
+        if sel is None:
+            continue
+        for i in np.flatnonzero(sel & (feats.kind == 3)):
+            for part in feats.parts(i):
+                if not part or len(part[0]) < 3:
+                    continue
+                ring = np.asarray(part[0], np.float64)
+                pads.append((ring[:, 1], ring[:, 0]))
+    return pads
+
+
+def photo_lots(rgb, frame, x0, y0, size, feats_list):
+    """The photo with parking-lot polygons painted in the paved roads' colour (under the carriageways). Pure."""
+    import paintlist
+    return paintlist.paint(rgb, frame, x0, y0, size, (), feats_list, steps={"lots"}) if feats_list else rgb
+
+
+def photo_fields(rgb, frame, x0, y0, size, feats_list, roads=None, urban_fn=None, widths=None):
+    """The photo with dirt furrows parallel to each field's long side (FARM_*, in the field's outline drawn as PIL's
+    polygon). The photo stays between the furrows. A dirt road (and FARM_ROAD_CLEAR_M either side) is left as the
+    photo (its paint is translucent, so a stripe under it would show through). The phase is hashed from the feature
+    id, so a field split across photo tiles lines up with the shrubs vegetation.farm_foliage plants between the
+    furrows. Pure: rgb is not changed (paintlist.py: earthfast paint_photo's fields)."""
+    if rgb is None or size <= 0 or not feats_list:
+        return rgb
+    h, w = rgb.shape[:2]
+    if h == 0 or w == 0:
+        return rgb
+    import paintlist
+    return paintlist.paint(rgb, frame, x0, y0, size, roads or [], feats_list, urban_fn, widths, steps={"fields"})
+
+
+def _long_axis(xy):
+    """A unit axis along the ring's long side, pointing east, or north when it runs north-south."""
+    p = np.asarray(xy, np.float64)
+    if len(p) >= 2 and abs(p[0, 0] - p[-1, 0]) < 1e-6 and abs(p[0, 1] - p[-1, 1]) < 1e-6:
+        p = p[:-1]
+    if len(p) < 2:
+        return np.array([1.0, 0.0])
+    d = p - p.mean(axis=0)
+    cov = dnp.matmul(d.T, d)
+    tr = float(cov[0, 0] + cov[1, 1])
+    det = float(cov[0, 0] * cov[1, 1] - cov[0, 1] * cov[0, 1])
+    lam = tr / 2.0 + math.sqrt(max(tr * tr / 4.0 - det, 0.0))
+    if abs(float(cov[0, 1])) > 1e-8:
+        vx, vy = lam - float(cov[1, 1]), float(cov[0, 1])
+    elif float(cov[0, 0]) >= float(cov[1, 1]):
+        vx, vy = 1.0, 0.0
+    else:
+        vx, vy = 0.0, 1.0
+    n = math.hypot(vx, vy) or 1.0
+    u = np.array([vx / n, vy / n])
+    if u[0] < -1e-9 or (abs(u[0]) <= 1e-9 and u[1] < 0):
+        u = -u
+    return u
+
+
+def _field_phase(fid, xy):
+    """Metres of furrow shift, stable for one field across the tiles it crosses."""
+    if fid is not None and str(fid):
+        key = ("field", str(fid))
+    else:
+        c = np.asarray(xy, np.float64).mean(axis=0)
+        key = ("field", round(float(c[0]), 1), round(float(c[1]), 1))
+    h = hashlib.blake2b(repr(key).encode(), digest_size=8).digest()
+    return int.from_bytes(h, "little") / 2.0 ** 64 * FARM_ROW_M
+
+
+def _farmland(feats):
+    cls = feats.attrs.get("class")
+    return None if cls is None else np.isin(np.asarray(cls).astype(str), list(FARM_CLASSES))
+
+
+def lots_mask(frame, x0, y0, size, px, feats_list):
+    """The parking lots' coverage (px x px uint8, 255 inside) of a tile photo's square, or None."""
+    return pads_mask(frame, x0, y0, size, px, lot_pads(feats_list))
+
+
+def _parking(feats):
+    cls = feats.attrs.get("class")
+    if cls is None:
+        return None
+    sel = np.isin(cls.astype(str), list(PARKING_CLASSES))
+    surf = feats.attrs.get("surface")
+    if surf is not None:
+        import parking
+        bare = np.array([str(v or "").strip().lower() in parking.LOT_UNPAVED for v in surf], bool)
+        sel = sel & ~bare
+    return sel
+
+
+def _yards(feats):
+    cls = feats.attrs.get("class")
+    return None if cls is None else np.isin(cls.astype(str), list(YARD_CLASSES))
+
+
+def _plazas(feats):
+    cls, sub = feats.attrs.get("class"), feats.attrs.get("subtype")
+    if cls is None or sub is None:
+        return None
+    return (sub.astype(str) == "pedestrian") & np.isin(cls.astype(str), list(PLAZA_CLASSES))
+
+
+def _paint(idx, lat, lon, feats_list, select, material):
+    h, w = idx.shape
+    to_px = grid_affine(lat, lon)
+    im = Image.new("L", (w, h), 0)
+    draw = ImageDraw.Draw(im)
+    n = 0
+    for feats in feats_list:
+        if feats is None or len(feats) == 0:
+            continue
+        sel = select(feats)
+        if sel is None:
+            continue
+        for i in np.flatnonzero(sel & (feats.kind == 3)):
+            for part in feats.parts(i):
+                if not part:
+                    continue
+                ring = np.asarray(part[0], np.float64)
+                c, r = to_px(ring[:, 0], ring[:, 1])
+                if c.max() < 0 or c.min() > w or r.max() < 0 or r.min() > h:
+                    continue
+                draw.polygon(list(zip(c.tolist(), r.tolist())), fill=255)
+                n += 1
+    if n == 0:
+        return idx
+    out = idx.copy()
+    out[np.asarray(im) > 0] = material
+    return out
+
+
+def mask_names(stem):
+    return [f"{stem}_m{i}.png" for i in range(len(MATERIALS))]
+
+
+def write_masks(idx, out_dir, stem):
+    """One 0/255 greyscale PNG per material (rows as the heightmap's: row 0 = north), written
+    atomically. Returns the file names (in out_dir), in MATERIALS order."""
+    names = mask_names(stem)
+    for i, name in enumerate(names):
+        path = os.path.join(out_dir, name)
+        tmp = staging.tmp_for(path)
+        Image.fromarray(np.where(idx == i, 255, 0).astype(np.uint8), "L").save(tmp, format="PNG", compress_level=1)
+        staging.replace(tmp, path)
+    return names
+
+
+SNOW_BRIGHT = 165           # mean of r, g, b of the ground photo (0-255) from which a snow candidate stays snow, ...
+SNOW_GREY = 40              # ... with at most this spread between its channels (white, not pale scree)
+LAWN_GREEN = 10             # 2g - r - b of the ground photo above which a lawn candidate stays a lawn
+
+
+def photo_lawns(out_dir, ter_name, mask_names_, rgb):
+    """Detail mode: the block's LAWN samples where the ground photo (rgb (px, px, 3), row 0 = north, the
+    block's footprint) is not green turn DIRT (paved yards, lots and driveways: the grass layer's blades
+    over a pale photo looked like snow, Lancaster 2026-10-14). Patches the .ter's layer map and the two
+    masks in place, atomically. Returns the number of samples changed. Likewise SNOW (WorldCover "snow and ice")
+    where the photo is not snow-white turns LOOSE scree (the Stelvio Pass's summit in late summer: the snow layer's
+    white blur where the orthophoto has grey-brown gravel, the user's reports #40 / #44, 2026-10-17)."""
+    path = os.path.join(out_dir, ter_name)
+    with open(path, "rb") as f:
+        data = bytearray(f.read())
+    n = struct.unpack_from("<I", data, 1)[0]
+    off = 5 + 2 * n * n
+    lay = np.frombuffer(bytes(data[off:off + n * n]), np.uint8).reshape(n, n)       # row 0 = south
+    # the .ter's layer indices are into its own material list (write_ter: only the used ones): back to MATERIALS
+    o = off + n * n + 4
+    names = []
+    for _ in range(struct.unpack_from("<I", data, off + n * n)[0]):
+        names.append(bytes(data[o + 1:o + 1 + data[o]]).decode())
+        o += 1 + data[o]
+    order = [m for m, _ in MATERIALS]
+    glob = [order.index(m) if m in order else DIRT for m in names]
+    to_glob = np.full(256, heightmap.TER_HOLE, np.uint8)
+    to_glob[:len(glob)] = glob
+    to_local = np.full(256, heightmap.TER_HOLE, np.uint8)
+    for li, gi in enumerate(glob):
+        to_local[gi] = li
+    lay = to_glob[lay]
+    lawn = lay == LAWN
+    snow = lay == SNOW
+    if not lawn.any() and not snow.any():
+        return 0
+    px = rgb.shape[0]
+    rows = np.clip(((n - 1 - np.arange(n)) + 0.5) * px / n, 0, px - 1).astype(np.int64)
+    cols = np.clip((np.arange(n) + 0.5) * px / n, 0, px - 1).astype(np.int64)
+    c = rgb.astype(np.int32)[rows[:, None], cols[None, :]]
+    exg = 2 * c[:, :, 1] - c[:, :, 0] - c[:, :, 2]
+    green = exg > LAWN_GREEN
+    white = (c.mean(2) >= SNOW_BRIGHT) & (c.max(2) - c.min(2) <= SNOW_GREY)
+    bare = lawn & ~green
+    scree = snow & ~white
+    if to_local[DIRT] == heightmap.TER_HOLE:
+        bare[:] = False
+    if to_local[LOOSE] == heightmap.TER_HOLE:
+        scree[:] = False
+    k = int(bare.sum() + scree.sum())
+    if not k:
+        return 0
+    lay = lay.copy()
+    lay[bare] = DIRT
+    lay[scree] = LOOSE
+    data[off:off + n * n] = to_local[lay].tobytes()
+    tmp = staging.tmp_for(path)
+    with open(tmp, "wb") as f:
+        f.write(data)
+    staging.replace(tmp, path)
+    north = lay[::-1]
+    for i in (LAWN, DIRT, SNOW, LOOSE):
+        p = os.path.join(out_dir, mask_names_[i])
+        tmp = staging.tmp_for(p)
+        Image.fromarray(np.where(north == i, 255, 0).astype(np.uint8), "L").save(tmp, format="PNG", compress_level=1)
+        staging.replace(tmp, p)
+    return k
+
+
+def used_materials(idx):
+    """The MATERIALS indices a block's .ter lists: those its samples use (holes aside), plus what photo_lawns may
+    turn them into (LAWN -> DIRT, SNOW -> LOOSE), in MATERIALS order. Each distinct material a .ter lists costs
+    the engine's first draw after the swap ~20 ms (in-game probes 2026-10-18 at Tower Bridge: one material
+    55-80 ms, three 80-180, all ten 250-560 ms in RenderShadows, whether a sample uses them or not)."""
+    u = set(np.unique(np.asarray(idx, np.uint8)).tolist())
+    u.discard(heightmap.TER_HOLE)
+    if LAWN in u:
+        u.add(DIRT)
+    if SNOW in u:
+        u.add(LOOSE)
+    return sorted(u) or [DIRT]
+
+
+# Fewer ground layers per block (the user, 2026-11-11: "combine the ground layers and reduce them without reducing
+# quality"). Every material a .ter lists costs the engine's texture-array rebuild at the swap (used_materials), and most
+# blocks list one or two that only specks and thin lines use: rock along a city's piers, banks and kerbs (Fells Point,
+# Lower Manhattan: 100-170 bits, 0.2-0.6 % of the block, 1-4 m wide), a gravel speck in a suburb, a lawn or two in the
+# mountains (offline survey 2026-11-11). Such a land-cover layer is folded into the layers around it (each of its
+# samples takes its nearest kept neighbour's material, the land cover's before a painted one: earthfast.layer_fold),
+# when it is
+#   - a land-cover layer that a few samples may give up (FOLD_FROM: no road, paving, plaza, golf or water bed layer,
+#     and none of its samples painted over the land cover: roads, lots, fields, mapped lawns, pads),
+#   - at most FOLD_SHARE of the block's samples, with at most FOLD_CORE_M2 of it farther than FOLD_CORE_R_M from any
+#     other material (its "core": the part seen as an area of its own; specks and lines up to ~4 m wide have none). Over
+#     the aerial photo the only difference is the detail texture's grain there, under a wheel its ground model.
+# A block listing more than LAYER_CAP materials after that (golf courses, squares and sea in one block; none of the
+# surveyed ones) then merges its look-alike layers (LOOKALIKE: the same grass at another grain or stone paving, each
+# pair one ground model), then folds its least used land-cover layers whatever their size: a visible but rare loss,
+# against a 250-560 ms swap with ten materials (in-game probes 2026-10-18). BNE_LAYER_FOLD=off: every layer kept.
+FOLD_ON = os.environ.get("BNE_LAYER_FOLD", "on").lower() not in ("off", "0", "false", "no")
+FOLD_FROM = (GRASS, LAWN, DUSTY, ROCK, SNOW)
+FOLD_SHARE = 0.01
+FOLD_CORE_R_M = 2.0
+FOLD_CORE_M2 = 256.0
+LAYER_CAP = 9
+# (dropped, kept): golf greens and fairways are the same grass at another grain, fairways mown lawns, a rough long
+# grass; brick and setts both stone paving; pavers the asphalt's ground model
+LOOKALIKE = ((GOLF_GREEN, GOLF_FAIRWAY), (BRICK, COBBLE), (GOLF_FAIRWAY, LAWN), (GOLF_ROUGH, GRASS), (PAVERS, ASPHALT))
+
+
+def core_radius(square):
+    """FOLD_CORE_R_M in samples `square` m apart (at least 1)."""
+    return max(1, int(round(FOLD_CORE_R_M / square)))
+
+
+def fold_policy(counts, painted, core, n, square, cap=LAYER_CAP):
+    """Which MATERIALS indices a block gives up (fold_layers' rules) from its layer statistics (earthfast.layer_stats:
+    samples, painted samples and core samples per index, n² samples `square` m apart). Returns (folded: indices whose
+    samples take their neighbours' materials, merged: [(dropped, kept)] whose samples become `kept`)."""
+    folded, merged = [], []
+    max_n = FOLD_SHARE * n * n
+    max_core = FOLD_CORE_M2 / (square * square)
+    for m in FOLD_FROM:
+        if counts[m] and not painted[m] and counts[m] <= max_n and core[m] <= max_core:
+            folded.append(m)
+
+    def listed():
+        live = [i for i in range(len(MATERIALS))
+                if counts[i] and i not in folded and all(i != a for a, _ in merged)]
+        return set(used_materials(np.array(live, np.uint8))) if live else set()
+    if len(listed()) > cap:
+        for a, b in LOOKALIKE:
+            now = listed()
+            if len(now) <= cap:
+                break
+            if a in now and b in now:
+                merged.append((a, b))
+        rest = sorted((m for m in FOLD_FROM if counts[m] and m not in folded and not painted[m]),
+                      key=lambda m: counts[m])
+        for m in rest:
+            if len(listed()) <= cap:
+                break
+            folded.append(m)
+    return folded, merged
+
+
+def fold_layers(idx, land, square, stages=None):
+    """The block's layer map (idx: MATERIALS indices, rows as written, row 0 = south) with fold_policy's layers given
+    up; land: the same map before anything was painted over the land cover (classify and the water bed). Returns the
+    new map (idx itself when nothing changes). stages (optional): gets "layersFolded" (how many listed materials fewer)
+    and the time."""
+    if not FOLD_ON or idx is None:
+        return idx
+    import fast
+    fast.require(220, "ground layer fold")
+    t0 = time.perf_counter()
+    idx = np.ascontiguousarray(idx, np.uint8)
+    painted = np.ascontiguousarray(idx != np.asarray(land, np.uint8), np.uint8)
+    n = idx.shape[0]
+    counts, paint, core = fast._ef.layer_stats(idx, painted, int(FOLD_SHARE * n * n), core_radius(square))
+    folded, merged = fold_policy(counts, paint, core, n, square)
+    if not folded and not merged:
+        return idx
+    out = idx
+    if merged:
+        lut = np.arange(256, dtype=np.uint8)
+        for a, b in merged:
+            lut[lut == a] = b
+        out = lut[out]
+    if folded:
+        drop = np.zeros(256, np.uint8)
+        drop[folded] = 1
+        out = fast._ef.layer_fold(np.ascontiguousarray(out), drop, painted)
+    if stages is not None:
+        live = [i for i in range(len(MATERIALS)) if counts[i]]
+        gone = set(folded) | {a for a, _ in merged}
+        stages["layersFolded"] = len(used_materials(np.array(live, np.uint8))) - len(
+            used_materials(np.array([i for i in live if i not in gone], np.uint8)))
+        stages["layerFold"] = time.perf_counter() - t0
+    return out
+
+
+def write_ter(out_dir, name, qgrid, idx):
+    """The block's .ter (heightmap.write_ter) with the materials its samples use (idx: MATERIALS indices, row
+    0 = south; used_materials) or, idx None, the level's single dirt layer (the mod's terrain.MATERIAL).
+    Returns (name, the MATERIALS indices listed in order, None for the single dirt layer)."""
+    if idx is None:
+        heightmap.write_ter(os.path.join(out_dir, name), qgrid, None, [MATERIALS[DIRT][0]])
+        return name, None
+    used = used_materials(idx)
+    lut = np.full(256, heightmap.TER_HOLE, np.uint8)
+    lut[used] = np.arange(len(used), dtype=np.uint8)
+    heightmap.write_ter(os.path.join(out_dir, name), qgrid, lut[np.asarray(idx, np.uint8)],
+                        [MATERIALS[i][0] for i in used])
+    return name, used
+
+
+class Surface:
+    """Land cover for the blocks, from the map-data cache, never waiting for the network."""
+
+    def __init__(self, mapdata):
+        self.md = mapdata
+        self.pool = ThreadPoolExecutor(1, thread_name_prefix="surface-prefetch")
+        self._lock = threading.Lock()
+        self._pending = set()
+        self._pending_layers = set()    # (key, layers) queued
+        self._last = None           # (lat, lon) of the last prefetch
+        self.bus_pads = False       # bus station yards painted (busyard.tile_pads: the road tiles' pads, kept as the gas stations')
+        self.gas_pads = False       # gas station forecourts painted asphalt (earthd --gas-stations on: fuel_pads)
+        self.extra_pads = None      # (lat, lon) -> more pads painted the same (airportgrade's runway_pads)
+        self._fuel_pads = {}        # station id -> (rings [(lat (k,), lon (k,))], bbox), the last FUEL_PAD_STATIONS
+        self._frontage_pads = {}    # tile id and material -> (rings, bbox), for material layers only
+
+    def close(self):
+        self.pool.shutdown(wait=False)
+
+    def _cached(self, key):
+        """The cell's land-cover Raster from the cache, None if absent (a fetch is queued) or no
+        coverage (open ocean: the layer is stored as missing)."""
+        if not self.md.has(key, "landcover"):
+            self._queue(key)
+            return None
+        try:        # (mapdata's memory LRU: a far tile's road paint and every block read the same cells again)
+            return self.md.cell(key, layers=("landcover",), kind="background").layers.get("landcover")
+        except Exception as e:      # an unreadable cache file: like a missing one
+            log.debug("surface: land cover of %s: %s: %s", key, type(e).__name__, e)
+            return None
+
+    def _queue(self, key, layers=("landcover",)):
+        with self._lock:
+            if (key, layers) in self._pending_layers:
+                return
+            self._pending_layers.add((key, layers))
+            self._pending.add(key)
+
+        def run():
+            try:
+                self.md.prefetch(key, layers)
+            except Exception as e:      # network trouble: asked again by the next block / prefetch
+                log.debug("surface: land cover of %s: %s: %s", key, type(e).__name__, e)
+            finally:
+                with self._lock:
+                    self._pending_layers.discard((key, layers))
+                    if not any(k == key for k, _ in self._pending_layers):
+                        self._pending.discard(key)
+        self.pool.submit(run)
+
+    def prefetch(self, lat, lon, radius_m=PREFETCH_M):
+        """Queue the land cover of the cells within radius_m (at most every PREFETCH_MOVE_M)."""
+        if self._last is not None:
+            dlat = (lat - self._last[0]) * 111320.0
+            dlon = (lon - self._last[1]) * 111320.0 * dmath.cos(math.radians(lat))
+            if dlat * dlat + dlon * dlon < PREFETCH_MOVE_M * PREFETCH_MOVE_M:
+                return
+        self._last = (lat, lon)
+        dlat = radius_m / 111320.0
+        dlon = radius_m / (111320.0 * max(0.05, dmath.cos(math.radians(lat))))
+        # a file test, not a load: this runs on the server's event loop at every pose, and reading each
+        # cell's arrays there stalled it for seconds while driving (2026-10-12); an unreadable file is
+        # rebuilt when a block reads it
+        for key in mapcells.cells_for_bbox(lat - dlat, lon - dlon, lat + dlat, lon + dlon):
+            if not self.md.has(key, "landcover"):
+                self._queue(key)
+            if not self.md.has(key, "roads"):
+                self._queue(key, ("roads",))
+
+    def ready(self, lat, lon, radius_m=1000.0, timeout_s=3.0):
+        """Fetch the land cover within radius_m now, and the squares and lots (land_use, infrastructure:
+        paint_lots) too, and wait for them, at most timeout_s (a teleport's first block: built once and kept
+        while the player stands still; Cluj's Piata Unirii stayed bare ground, its square not cached yet).
+        Returns True if it all arrived. Worker threads only (it blocks)."""
+        dlat = radius_m / 111320.0
+        dlon = radius_m / (111320.0 * max(0.05, dmath.cos(math.radians(lat))))
+        cells = mapcells.cells_for_bbox(lat - dlat, lon - dlon, lat + dlat, lon + dlon)
+        keys = []
+        for layer in ("landcover", "land_use", "infrastructure"):
+            for k in cells:
+                if not self.md.has(k, layer):
+                    self._queue(k, (layer,))
+                    keys.append(k)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not any(self._is_queued(k) for k in keys):
+                return True
+            time.sleep(0.05)
+        return False
+
+    @profile_step('Surface road data')
+    def roads(self, lat, lon):
+        """(the "roads" Features of the cells around the points that are cached, complete). Never waits:
+        missing cells are fetched in the background."""
+        lat = np.asarray(lat, np.float64)
+        lon = np.asarray(lon, np.float64)
+        out, complete = [], True
+        for key in mapcells.cells_for_points(lat, lon):
+            if not self.md.has(key, "roads"):
+                self._queue(key, ("roads",))
+                complete = False
+                revisit.fault()             # (left out: nothing built now is kept)
+                continue
+            try:
+                out.append(self.md.cell(key, layers=("roads",), kind="background").layers.get("roads"))
+            except Exception as e:      # an unreadable cache file: like a missing one
+                log.debug("surface: roads of %s: %s: %s", key, type(e).__name__, e)
+                complete = False
+        return out, complete
+
+    def road_routes(self, lat, lon):
+        """{segment id: routes_txt} of the road_routes layers (Overture's route numbers, overture "road_routes":
+        "network|ref|from|to;...") of the cached cells around the point, for the status bar's road (an Interstate has
+        a number, often no name). Never waits: missing cells are fetched in the background."""
+        out = {}
+        for key in mapcells.cells_for_points(np.asarray([lat], np.float64), np.asarray([lon], np.float64)):
+            if not self.md.has(key, "road_routes"):
+                self._queue(key, ("road_routes",))
+                continue
+            try:
+                layer = self.md.cell(key, layers=("road_routes",), kind="background").layers.get("road_routes")
+            except Exception as e:      # an unreadable cache file: no numbers this time
+                log.debug("surface: road routes of %s: %s: %s", key, type(e).__name__, e)
+                continue
+            if layer is None or not len(layer) or layer.attrs.get("routes_txt") is None:
+                continue
+            txt = layer.attrs["routes_txt"]
+            for i, fid in enumerate(layer.ids):
+                out.setdefault(str(fid), str(txt[i]))
+        return out
+
+    def add_fuel_pads(self, items):
+        """Keep the road tile's fuel and frontage pads. Return the changed footprints for refresh."""
+        new = []
+        with self._lock:
+            for sid, rings in items:
+                frontage = sid.startswith(FRONTAGE_PAD_PREFIX)
+                store = self._frontage_pads if frontage else self._fuel_pads
+                previous = store.pop(sid, None)
+                rings = [(np.asarray(la, np.float64), np.asarray(lo, np.float64)) for la, lo in rings]
+                box = None
+                if rings:
+                    box = (min(float(la.min()) for la, _ in rings), min(float(lo.min()) for _, lo in rings),
+                           max(float(la.max()) for la, _ in rings), max(float(lo.max()) for _, lo in rings))
+                    store[sid] = rings, box
+                    cap = FRONTAGE_PAD_TILES if frontage else FUEL_PAD_STATIONS
+                    if len(store) > cap:
+                        store.pop(next(iter(store)))
+                if not frontage and rings and previous is None:
+                    new.append((sid, rings))
+                if frontage and (box is not None or previous is not None):
+                    old, old_box = previous if previous is not None else ([], box)
+                    if len(rings) == len(old) and all(np.array_equal(a, b) and np.array_equal(c, d)
+                                                      for (a, c), (b, d) in zip(rings, old)):
+                        continue
+                    # One affected envelope per tile, even when it contains hundreds of small polygons.
+                    s, w, n, e = box if box is not None else old_box
+                    os_, ow, on, oe = old_box
+                    new.append((sid, [(np.array([min(s, os_), max(n, on)]),
+                                       np.array([min(w, ow), max(e, oe)]))]))
+        return new
+
+    def clear_fuel_pads(self, *, all_road_pads=False):
+        """A gas toggle keeps frontage pads. A terrain worker starts each job with the server's pads."""
+        with self._lock:
+            for sid in [k for k in self._fuel_pads if not str(k).startswith("bus:")]:     # (the bus yards stay)
+                del self._fuel_pads[sid]
+            if all_road_pads:
+                self._frontage_pads.clear()
+
+    def _pad_items(self, store, lat, lon):
+        if not store:
+            return []
+        lat, lon = np.asarray(lat, np.float64), np.asarray(lon, np.float64)
+        la0, la1, lo0, lo1 = float(lat.min()), float(lat.max()), float(lon.min()), float(lon.max())
+        with self._lock:
+            return [(sid, rings) for sid, (rings, (a0, b0, a1, b1)) in store.items()
+                    if a1 >= la0 and a0 <= la1 and b1 >= lo0 and b0 <= lo1]
+
+    def fuel_pad_items(self, lat, lon):
+        """[(station id, rings)] of the kept pads within the points' bounding box (gas stations', bus station yards',
+        walkways' loose pads); [] when neither gas_pads nor bus_pads is on."""
+        return self._pad_items(self._fuel_pads, lat, lon) if (self.gas_pads or self.bus_pads) else []
+
+    def bus_pad_items(self, lat, lon):
+        """[(station id, rings)] of the kept bus station yards ("bus:" ids) within the points' bounding box (busyard.YardGrader
+        levels the ground there); [] when bus_pads is off."""
+        if not self.bus_pads:
+            return []
+        return [(sid, rings) for sid, rings in self._pad_items(self._fuel_pads, lat, lon) if str(sid).startswith("bus:")]
+
+    def frontage_pad_items(self, lat, lon):
+        return self._pad_items(self._frontage_pads, lat, lon)
+
+    def pad_digest(self, la0, la1, lo0, lo1, bus_only=False):
+        """A hash of the kept pads whose boxes reach the box (degrees): the bus station yards (the ground's levelling,
+        busyard.YardGrader) and, unless bus_only, the fuel and frontage pads (paint_ground_pads), each in the order
+        kept (the painters draw them so), with the switches that select them. The disk block cache's keys
+        (blockcache.py): a block or chunk built before a road tile handed in a pad near it is another one."""
+        import hashlib
+        lat, lon = np.array([la0, la1], np.float64), np.array([lo0, lo1], np.float64)
+        h = hashlib.sha256(repr((bool(self.gas_pads), bool(self.bus_pads), bool(bus_only))).encode())
+        h.update(groundclass.digest(la0, la1, lo0, lo1).encode())      # (the photo's ground classes under the box)
+        stores = [self._fuel_pads] if bus_only else [self._fuel_pads, self._frontage_pads]
+        for store in stores:
+            for sid, rings in self._pad_items(store, lat, lon):
+                if bus_only and not (self.bus_pads and str(sid).startswith("bus:")):
+                    continue
+                h.update(repr(sid).encode() + b"\0")
+                for la, lo in rings:
+                    h.update(np.ascontiguousarray(la, np.float64).tobytes() + b"|"
+                             + np.ascontiguousarray(lo, np.float64).tobytes() + b";")
+            h.update(b"#")
+        if not bus_only:
+            import gardens      # (a square baked after a block was built: the block again)
+            h.update(gardens.digest(la0, la1, lo0, lo1, getattr(self.md, "cache_dir", None)))
+        return h.digest()
+
+    def paint_ground_pads(self, idx, lat, lon):
+        idx = paint_pads(idx, lat, lon, self.fuel_pads(lat, lon))
+        hard, grass = [], []
+        for sid, rings in self.frontage_pad_items(lat, lon):
+            (grass if sid.startswith(FRONTAGE_GRASS_PREFIX) else hard).extend(rings)
+        idx = paint_frontage_pads(idx, lat, lon, grass, GRASS)
+        import gardens      # (the baked gardens: lawn, beds, terraces, driveways; under the frontage's hard pads)
+        idx = gardens.paint(idx, lat, lon, getattr(self.md, "cache_dir", None))
+        return paint_frontage_pads(idx, lat, lon, hard)
+
+    def fuel_pads(self, lat, lon):
+        """[(lat (k,), lon (k,))] of the kept pads within the points' bounding box (the painters'; never waits), and
+        extra_pads' (the runways)."""
+        out = [r for _, rings in self.fuel_pad_items(lat, lon) for r in rings]
+        if self.extra_pads is not None:
+            try:
+                out += self.extra_pads(np.asarray(lat, np.float64), np.asarray(lon, np.float64))
+            except Exception as e:      # (no runways rather than no ground)
+                log.debug("surface: extra pads: %s: %s", type(e).__name__, e)
+        return out
+
+    def lots(self, lat, lon):
+        """The "infrastructure" and "land_use" Features of the cells around the points that are cached
+        (parking lots, squares: paint_lots); never waits (missing cells are fetched in the background)."""
+        lat = np.asarray(lat, np.float64)
+        lon = np.asarray(lon, np.float64)
+        out = []
+        for key in mapcells.cells_for_points(lat, lon):
+            for layer in ("infrastructure", "land_use"):
+                if not self.md.has(key, layer):
+                    self._queue(key, (layer,))
+                    revisit.fault()         # (left out: nothing built now is kept)
+                    continue
+                try:
+                    out.append(self.md.cell(key, layers=(layer,), kind="background").layers.get(layer))
+                except Exception as e:      # an unreadable cache file: like a missing one
+                    log.debug("surface: %s of %s: %s: %s", layer, key, type(e).__name__, e)
+        return out
+
+    def urban(self, lat, lon):
+        """Built-up land cover (WorldCover 50) at the points: roads.road_specs's urban_fn. Uncached cells
+        read as not built-up."""
+        return self.classes(lat, lon)[0] == roadsmod.URBAN_CLASS
+
+    @profile_step('Land cover')
+    def classes(self, lat, lon):
+        """(WorldCover class per point, complete): 0 (no data) where the cell is not cached yet. The
+        land cover is read at the warped points (warp: organic borders)."""
+        lat, lon = warp(lat, lon)
+        out = np.zeros(lat.shape, np.uint8)
+        complete = True
+        for key in mapcells.cells_for_points(lat, lon):
+            r = self._cached(key)
+            lon0, lat0, lon1, lat1 = key.bounds()
+            inside = (lat >= lat0) & (lat < lat1) & (lon >= lon0) & (lon < lon1)
+            if not inside.any():
+                continue
+            if r is None:
+                complete = complete and not self._is_queued(key)
+                if not complete:
+                    revisit.fault()         # (not cached yet: nothing built now is kept)
+                continue
+            out[inside] = r.sample(lon[inside], lat[inside])
+        out[np.abs(lat) > mapcells.MAX_LAT] = POLAR_CLASS
+        return out, complete
+
+    def block_classes(self, frame, cx, cy, lat, lon):
+        """Raw classes on a physics block's exact lattice, with bounded native reuse of overlapping chunks.
+
+        MapData's decoded layers are immutable. Weak identity tokens invalidate cached classes when a layer is
+        replaced or reloaded, without pinning its data. Incomplete inputs are never retained; overrides stay live.
+        Arbitrary-point consumers still use classes(). This is cache marshalling, not a second sampler/cache.
+        """
+        fast.require(171, "physics-block land-cover reuse")
+        lat, lon = np.asarray(lat, np.float64), np.asarray(lon, np.float64)
+        bounds = fast._ef.class_grid_bounds(lat, lon, WARP_OCTAVES)
+        if bounds is None:
+            return self.classes(lat, lon)
+        sources, snapshots = [], []
+        for key in mapcells.cells_for_bbox(*bounds):
+            # Check only; an unused halo cell must not trigger a download or an incomplete-input fault.
+            if not self.md.has(key, "landcover"):
+                return self.classes(lat, lon)
+            raster = self._cached(key)
+            snapshots.append(raster)  # pin only during this call, never for the cache's lifetime
+            sources.append((str(key), None if raster is None else weakref.ref(raster)))
+        cache = getattr(self, "_class_grid", None)
+        if cache is None:
+            cache = self._class_grid = fast._ef.ClassGridCache(8 * 1024 * 1024)
+        n = lat.shape[0]
+        if lat.shape != (n, n) or lon.shape != lat.shape:
+            raise ValueError("block_classes needs matching square grids")
+        plan, missing = cache.lookup((frame.lat0, frame.lon0, frame.h0, heightmap.SQUARE), WARP_OCTAVES,
+                                     heightmap.lattice_index(cx, n), heightmap.lattice_index(cy, n), n, sources)
+        values, complete = (self.classes(lat.ravel()[missing], lon.ravel()[missing]) if len(missing)
+                            else (np.empty(0, np.uint8), True))
+        return cache.finish(plan, np.ascontiguousarray(values, np.uint8), complete), complete
+
+    def _is_queued(self, key):
+        with self._lock:
+            return key in self._pending

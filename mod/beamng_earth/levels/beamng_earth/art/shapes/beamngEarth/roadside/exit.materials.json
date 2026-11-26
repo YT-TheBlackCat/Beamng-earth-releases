@@ -1,0 +1,509 @@
+{
+  "bne_mile_green": {
+    "name": "bne_mile_green",
+    "mapTo": "bne_mile_green",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.012,
+          0.3,
+          0.165,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": true
+  },
+  "bne_mile_red": {
+    "name": "bne_mile_red",
+    "mapTo": "bne_mile_red",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.62,
+          0.018,
+          0.028,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_mile_blue": {
+    "name": "bne_mile_blue",
+    "mapTo": "bne_mile_blue",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.012,
+          0.045,
+          0.34,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_exit_green": {
+    "name": "bne_exit_green",
+    "mapTo": "bne_exit_green",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.015,
+          0.235,
+          0.115,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": true
+  },
+  "bne_exit_white": {
+    "name": "bne_exit_white",
+    "mapTo": "bne_exit_white",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.93,
+          0.95,
+          0.89,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": true
+  },
+  "bne_exit_metal": {
+    "name": "bne_exit_metal",
+    "mapTo": "bne_exit_metal",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.42,
+          0.45,
+          0.46,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.65
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": true
+  },
+  "bne_exit_letters": {
+    "name": "bne_exit_letters",
+    "mapTo": "bne_exit_letters",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.97,
+          0.98,
+          0.94,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0,
+        "opacityMap": "/levels/beamng_earth/art/shapes/beamngEarth/roadside/sign_letters_o.data.dds",
+        "opacityFactor": 1.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false,
+    "alphaTest": true,
+    "alphaRef": 64,
+    "translucent": false
+  },
+  "bne_exit_blue": {
+    "name": "bne_exit_blue",
+    "mapTo": "bne_exit_blue",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.012,
+          0.065,
+          0.34,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": true
+  },
+  "bne_guide_red": {
+    "name": "bne_guide_red",
+    "mapTo": "bne_guide_red",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.65,
+          0.018,
+          0.03,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_guide_black": {
+    "name": "bne_guide_black",
+    "mapTo": "bne_guide_black",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.008,
+          0.009,
+          0.01,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_guide_letters": {
+    "name": "bne_guide_letters",
+    "mapTo": "bne_guide_letters",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.97,
+          0.98,
+          0.94,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0,
+        "opacityMap": "/levels/beamng_earth/art/shapes/beamngEarth/roadside/sign_letters_o.data.dds",
+        "opacityFactor": 1.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false,
+    "alphaTest": true,
+    "alphaRef": 64,
+    "translucent": false
+  },
+  "bne_guide_letters_black": {
+    "name": "bne_guide_letters_black",
+    "mapTo": "bne_guide_letters_black",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.008,
+          0.009,
+          0.01,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0,
+        "opacityMap": "/levels/beamng_earth/art/shapes/beamngEarth/roadside/sign_letters_o.data.dds",
+        "opacityFactor": 1.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false,
+    "alphaTest": true,
+    "alphaRef": 64,
+    "translucent": false
+  },
+  "bne_signs_vienna_w": {
+    "name": "bne_signs_vienna_w",
+    "mapTo": "bne_signs_vienna_w",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorMap": "/levels/beamng_earth/art/shapes/beamngEarth/bne_signs_vienna.color.dds",
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_signs_vienna_y": {
+    "name": "bne_signs_vienna_y",
+    "mapTo": "bne_signs_vienna_y",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorMap": "/levels/beamng_earth/art/shapes/beamngEarth/bne_signs_vienna.color.dds",
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_se_signs": {
+    "name": "bne_se_signs",
+    "mapTo": "bne_se_signs",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorMap": "/levels/beamng_earth/art/shapes/beamngEarth/bne_se_signs.dds",
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_se_signs2": {
+    "name": "bne_se_signs2",
+    "mapTo": "bne_se_signs2",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorMap": "/levels/beamng_earth/art/shapes/beamngEarth/bne_se_signs2.dds",
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_de_signs": {
+    "name": "bne_de_signs",
+    "mapTo": "bne_de_signs",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorMap": "/levels/beamng_earth/art/shapes/beamngEarth/bne_de_signs.dds",
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_de_zones": {
+    "name": "bne_de_zones",
+    "mapTo": "bne_de_zones",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorMap": "/levels/beamng_earth/art/shapes/beamngEarth/bne_de_zones.dds",
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false
+  },
+  "bne_recreation_brown_opaque": {
+    "name": "bne_recreation_brown_opaque",
+    "mapTo": "bne_recreation_brown_opaque",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.3137254901960784,
+          0.16862745098039217,
+          0.07450980392156863,
+          1.0
+        ],
+        "roughnessFactor": 0.75,
+        "metallicFactor": 0.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "translucent": false,
+    "alphaTest": false,
+    "castShadows": true
+  },
+  "bne_forest_cream": {
+    "name": "bne_forest_cream",
+    "mapTo": "bne_forest_cream",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.95,
+          0.79,
+          0.38,
+          1
+        ],
+        "roughnessFactor": 0.92,
+        "metallicFactor": 0
+      },
+      {},
+      {},
+      {}
+    ],
+    "translucent": false,
+    "alphaTest": false,
+    "castShadows": true
+  },
+  "bne_forest_timber": {
+    "name": "bne_forest_timber",
+    "mapTo": "bne_forest_timber",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.31,
+          0.2,
+          0.1,
+          1
+        ],
+        "roughnessFactor": 0.92,
+        "metallicFactor": 0
+      },
+      {},
+      {},
+      {}
+    ],
+    "translucent": false,
+    "alphaTest": false,
+    "castShadows": true
+  },
+  "bne_forest_letters_cream": {
+    "name": "bne_forest_letters_cream",
+    "mapTo": "bne_forest_letters_cream",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.99,
+          0.87,
+          0.55,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0,
+        "opacityMap": "/levels/beamng_earth/art/shapes/beamngEarth/roadside/sign_letters_o.data.dds",
+        "opacityFactor": 1.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false,
+    "alphaTest": true,
+    "alphaRef": 64,
+    "translucent": false
+  },
+  "bne_forest_letters_brown": {
+    "name": "bne_forest_letters_brown",
+    "mapTo": "bne_forest_letters_brown",
+    "class": "Material",
+    "version": 1.5,
+    "Stages": [
+      {
+        "baseColorFactor": [
+          0.2,
+          0.075,
+          0.025,
+          1
+        ],
+        "roughnessFactor": 0.65,
+        "metallicFactor": 0.0,
+        "opacityMap": "/levels/beamng_earth/art/shapes/beamngEarth/roadside/sign_letters_o.data.dds",
+        "opacityFactor": 1.0
+      },
+      {},
+      {},
+      {}
+    ],
+    "castShadows": false,
+    "alphaTest": true,
+    "alphaRef": 64,
+    "translucent": false
+  }
+}

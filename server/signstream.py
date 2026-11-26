@@ -1,0 +1,328 @@
+"""Highway signs (from cody196's PR #363): optional scenery built per road tile after the tile's roads were sent,
+never part of their collision or readiness. A sign tile is sent as a `roads_tile` with key "s<tx>_<ty>" and the
+fields exits / mileposts / merges / speeds (render-only shapes, pooled slots); the mod's highwaySigns setting hides them.
+
+Every guide sign face is drawn to the US MUTCD (green guide panels, Interstate / US / state shields, the yellow merge
+diamond, Interstate mile markers): those are built where signstates finds a US state (BNE_SIGNS_WORLD=1: everywhere,
+for tests), elsewhere no sign data is asked for. The speed-limit signs (speedsigns.py, field speeds: the AI's limit, in
+each region's style) are built everywhere. On German Autobahnen the German guide signs (deautobahn.py, field autobahn:
+the RWBA chain at every exit, Kreuz and Dreieck from the sign text mapped in OpenStreetMap) where Germany's shards
+carry it."""
+from runtimeprofiler import ThreadPoolExecutor
+import json
+import logging
+import os
+import time
+
+import numpy as np
+
+import highwaysigns
+import mergesigns
+import roadmesh
+import roads
+import signstates
+import deautobahn
+import dirsigns
+import speedsigns
+import roadsigns
+import staging
+
+log = logging.getLogger('earthd.signs')
+KINDS = ('exits', 'mileposts', 'merges', 'speeds', 'dirs', 'rsigns', 'autobahn')
+WORKERS = 1                     # sign tiles in flight per connection (Tracker): a road tile waits behind one at most
+WORLD = os.environ.get("BNE_SIGNS_WORLD") == "1"
+
+
+def _short():
+    """A part of a sign tile failed (the tile goes on without it): its build is short, not kept in the revisit cache
+    (blockworker.signs_tile)."""
+    import revisit
+    revisit.fault(here=True)
+
+
+def shape_files(aid, tx, ty):
+    return {kind: f'{kind}_{aid}_{tx}_{ty}.cdae' for kind in KINDS}
+
+
+def write_tile(out_dir, vfs_dir, aid, tx, ty, meshes, dirs_faces=None):
+    x, y, _, _ = roads.tile_bbox(tx, ty)
+    data = {'v': roads.VERSION, 'chunks': []}
+    for kind, mesh in zip(KINDS, meshes):
+        if mesh is None:
+            continue
+        name = shape_files(aid, tx, ty)[kind]
+        roadmesh.write(os.path.join(out_dir, name), mesh)
+        data[kind] = {'shape': f'{vfs_dir}/{name}', 'pos': [x, y, 0.]}
+    if dirs_faces:                  # the direction boards' pictures: the mod makes their Materials first (dirsigns.lua)
+        data['dirs_faces'] = dirs_faces
+    # An empty replacement is intentional: it retires signs from an older index.
+    name = f'signs_{aid}_{tx}_{ty}.json'
+    path = os.path.join(out_dir, name)
+    tmp = staging.tmp_for(path)
+    with open(tmp, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(data, separators=(',', ':')))
+    staging.replace(tmp, path)
+    return f'{vfs_dir}/{name}', sum(1 for kind in KINDS if kind in data)
+
+
+def build_tile(md, frame, aid, tx, ty, elev, out_dir, vfs_dir, urban=None, widths=None,
+               left_hand=False, mph=True, country=None, dirs=False, rsigns=False, dej=False, towns=None):
+    source = getattr(md, 'highway_signs', None)
+    if source is None:
+        return None
+    x0, y0, x1, y1 = roads.tile_bbox(tx, ty)
+    la, lo, _ = frame.enu_to_geodetic(np.array([x0, x1]), np.array([y0, y1]), 0.)
+    us = bool((signstates.states(la, lo) != '').any())
+    context = source.context(urban, widths)
+    feats = context.around(np.c_[lo, la])
+    # Conservative deck footprints exclude ground signs on/under overpasses without
+    # rebuilding road meshes or solving bridge heights in this optional queue.
+    decks = []
+    for i, spec in enumerate(roads.bridge_specs(feats)):
+        if spec is None:
+            continue
+        for ring in roads.bridge_parts(feats, i):
+            if len(ring) >= 2:
+                pts = np.column_stack(frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.))
+                decks.append({'deck': True, 'n': pts, 'w': spec.width})
+    # German Autobahn signs: a tile in Germany (real borders, behind a box) whose shards carry the German block
+    german = _german(source, frame, tx, ty)
+    autobahn = _autobahn(md, frame, tx, ty, elev, context, left_hand) if german else None
+    speeds = _speeds(frame, tx, ty, elev, context, decks, left_hand, mph, speedsigns.style(country, us), dej, towns)
+    dir_mesh, dir_faces = (_dirs(md, frame, tx, ty, elev, context, decks, left_hand, mph, out_dir, vfs_dir, aid,
+                                 autobahn=german) if dirs else (None, {}))
+    rsign_mesh = _rsigns(md, frame, tx, ty, elev, context, decks, left_hand, mph, country) if rsigns else None
+    import busstationsign               # the bus stations' name signs (on whether or not the direction boards are)
+    bus_mesh, bus_faces = _optional('Bus station signs', busstationsign.sign_tile, md, frame, tx, ty, elev, out_dir,
+                                    vfs_dir, country)
+    if bus_mesh is not None:
+        dir_mesh, dir_faces = busstationsign.merge(dir_mesh, bus_mesh), {**dir_faces, **bus_faces}
+    import railstationsign              # the railway stations' name boards, platform plates and halls' names
+    rail_mesh, rail_faces = _optional('Rail station signs', railstationsign.sign_tile, md, frame, tx, ty, elev, out_dir,
+                                      vfs_dir, country)
+    if rail_mesh is not None:
+        dir_mesh, dir_faces = busstationsign.merge(dir_mesh, rail_mesh), {**dir_faces, **rail_faces}
+    import euguardrails
+    french = False
+    if euguardrails.enabled():
+        import countrybounds
+        # The anchor may be across the border: select the tile, then filter
+        # every French assembly at its actual position in highwaysigns.
+        samples = [frame.enu_to_geodetic(x, y, 0.) for x, y in
+                   ((x0, y0), (x0, y1), (x1, y0), (x1, y1), ((x0 + x1) / 2, (y0 + y1) / 2))]
+        french = 'FR' in countrybounds.bundled().codes_at([(la, lo) for la, lo, _ in samples])
+    if not (WORLD or us or french):
+        # (not the US: no guide signs)
+        return write_tile(out_dir, vfs_dir, aid, tx, ty, (None, None, None, speeds, dir_mesh, rsign_mesh, autobahn), dir_faces)
+    exits, miles = highwaysigns.build_tile(md, frame, tx, ty, elev, decks, left_hand, mph, urban, widths, french=french,
+                                         out_dir=out_dir, vfs_dir=vfs_dir, faces=dir_faces)
+    merges = None if french else mergesigns.build_tile(frame, tx, ty, [feats], elev, decks, urban, widths, left_hand, context)
+    return write_tile(out_dir, vfs_dir, aid, tx, ty, (exits, miles, merges, speeds, dir_mesh, rsign_mesh, autobahn), dir_faces)
+
+
+_warned = -float('inf')
+
+
+def _speeds(frame, tx, ty, elev, context, decks, left_hand, mph, face, de_on=False, towns=None):
+    """speedsigns.build_tile, or None: optional scenery never stops the other signs (towns: the town signs' towns,
+    townentry.Towns.town_state, when they are on)."""
+    global _warned
+    try:
+        return speedsigns.build_tile(frame, tx, ty, elev, context, decks, left_hand, mph, face, de_on=de_on,
+                                     towns=towns)
+    except Exception as error:
+        _short()
+        now = time.monotonic()
+        if now - _warned >= 60.:
+            _warned = now
+            log.warning('Speed-limit signs unavailable; roads continue: %s: %s', type(error).__name__, error)
+        return None
+
+
+def _rsigns(md, frame, tx, ty, elev, context, decks, left_hand, mph, country):
+    """roadsigns.build_tile, or None: optional scenery never stops the other signs."""
+    global _warned_rsigns
+    try:
+        return roadsigns.build_tile(md, frame, tx, ty, elev, context, decks, left_hand, mph, country)
+    except Exception as error:
+        _short()
+        now = time.monotonic()
+        if now - _warned_rsigns >= 60.:
+            _warned_rsigns = now
+            log.warning('Road signs unavailable; roads continue: %s: %s', type(error).__name__, error,
+                        exc_info=True)
+        return None
+
+
+_warned_rsigns = -float('inf')
+
+
+def _dirs(md, frame, tx, ty, elev, context, decks, left_hand, mph, out_dir, vfs_dir, aid=None, autobahn=False):
+    """dirsigns.build_tile: (mesh, faces) or (None, {}): optional scenery never stops the other signs."""
+    global _warned_dirs
+    try:
+        return dirsigns.build_tile(md, frame, tx, ty, elev, context, decks, left_hand, mph, out_dir, vfs_dir, aid=aid,
+                                   autobahn=autobahn)
+    except Exception as error:
+        _short()
+        now = time.monotonic()
+        if now - _warned_dirs >= 60.:
+            _warned_dirs = now
+            log.warning('Direction signs unavailable; roads continue: %s: %s', type(error).__name__, error,
+                        exc_info=True)
+        return None, {}
+
+
+_warned_dirs = -float('inf')
+
+def _optional(what, build, *args, **kw):
+    """build(*args, **kw), or (None, {}) when it fails: a station's signs never cost a road tile its other signs."""
+    global _warned_optional
+    try:
+        return build(*args, **kw)
+    except Exception as error:
+        _short()
+        now = time.monotonic()
+        if now - _warned_optional >= 60.:
+            _warned_optional = now
+            log.warning('%s unavailable; roads continue: %s: %s', what, type(error).__name__, error, exc_info=True)
+        return None, {}
+
+
+_warned_optional = -float('inf')
+_warned_de = -float('inf')
+
+
+def _german(source, frame, tx, ty):
+    """Whether the tile gets German Autobahn signs (and its direction boards step back on motorways): in Germany, with
+    the German block in its shards; never raises."""
+    global _warned_de
+    try:
+        return deautobahn.german_tile(frame, tx, ty) and deautobahn.data_here(source, frame, tx, ty)
+    except Exception as error:
+        _short()
+        now = time.monotonic()
+        if now - _warned_de >= 60.:
+            _warned_de = now
+            log.warning('German Autobahn signs unavailable; roads continue: %s: %s', type(error).__name__, error)
+        return False
+
+
+def _autobahn(md, frame, tx, ty, elev, context, left_hand):
+    """deautobahn.build_tile's mesh, or None: optional scenery never stops the other signs."""
+    global _warned_de
+    try:
+        mesh, boards = deautobahn.build_tile(md, frame, tx, ty, elev, context, left_hand)
+        if boards:
+            log.debug('autobahn signs %s,%s: %d boards', tx, ty, len(boards))
+        return mesh
+    except Exception as error:
+        _short()
+        now = time.monotonic()
+        if now - _warned_de >= 60.:
+            _warned_de = now
+            log.warning('German Autobahn signs unavailable; roads continue: %s: %s', type(error).__name__, error,
+                        exc_info=True)
+        return None
+
+
+class Tracker:
+    """Bounded sign jobs for ready road tiles; old results cannot survive reset/rebase."""
+    def __init__(self):
+        self.aid = None
+        self.sent, self.stale = set(), set()
+        self.jobs, self.retry = {}, {}
+        self.pool = None
+        self.revision = 0
+        self.closed = False
+        self.wanted = set()
+        self.version = None
+
+    def close(self):
+        self.closed = True
+        for future in self.jobs.values():
+            future.cancel()
+        self.jobs.clear()
+        if self.pool is not None:
+            self.pool.shutdown(wait=False, cancel_futures=True)
+
+    def refresh(self):
+        self.revision += 1
+        self.stale.update(self.sent)
+        self.retry.clear()
+
+    def on_pose(self, conn, aid, x, y, loop, build, ready, version=None):
+        """ready: the road tiles the mod has (roads.Tracker.sent); version: the sign data's build known now
+        (SignTags.known(): no network): a new one rebuilds the tiles sent."""
+        if self.closed:
+            return
+        if version != self.version:         # (None -> a build too: the tiles sent before had no sign data)
+            self.refresh()
+            self.version = version
+        if aid != self.aid:
+            # Keep running old jobs in the bounded queue until they finish; callbacks
+            # discard their results. Repeated teleports cannot grow an executor backlog.
+            self.aid = aid
+            self.sent.clear()
+            self.stale.clear()
+            self.retry.clear()
+        self.wanted = set(ready)
+        # Readiness gates the first build, not the lifetime of visible signs.
+        # A road retry/refresh temporarily loses readiness; keep its signs until
+        # the player leaves, with the same unloading margin as the roads.
+        self.wanted.update(k for k in self.sent if roads.tile_distance(*k, x, y) <= roads.DROP_M)
+        for key in self.sent - self.wanted:
+            conn.send({'type': 'roads_drop', 'anchorId': aid, 'key': f's{key[0]}_{key[1]}'})
+        self.sent.intersection_update(self.wanted)
+        self.stale.intersection_update(self.wanted)
+        self.retry = {k: t for k, t in self.retry.items() if k in self.wanted}
+        now = time.monotonic()
+        want = [k for k in self.wanted if (k not in self.sent or k in self.stale)
+                and (aid, k) not in self.jobs and self.retry.get(k, 0.) <= now]
+        want.sort(key=lambda k: roads.tile_distance(*k, x, y))
+        if want and self.pool is None:
+            self.pool = ThreadPoolExecutor(WORKERS, thread_name_prefix='highway-signs')
+        for key in want[:max(0, WORKERS - len(self.jobs))]:
+            future = loop.run_in_executor(self.pool, build, aid, *key)
+            self.jobs[aid, key] = future
+            future.add_done_callback(lambda f, a=aid, k=key, r=self.revision: self._built(conn, a, k, r, f))
+
+    def _built(self, conn, aid, key, revision, future):
+        self.jobs.pop((aid, key), None)
+        if future.cancelled():
+            return
+        try:
+            result = future.result()
+        except Exception:
+            if not self.closed and aid == self.aid and key in self.wanted:
+                self.retry[key] = time.monotonic() + 10.
+                log.warning('Highway signs %s unavailable; road tile retained', key, exc_info=True)
+            return
+        if self.closed or aid != self.aid or key not in self.wanted:
+            return
+        if revision != self.revision:
+            self.stale.add(key)
+            return
+        if result is None:
+            self.retry[key] = time.monotonic() + 10.
+            return
+        path, n = result
+        if n == 0 and key not in self.stale:    # (nothing to show, none shown before: no message)
+            self.sent.add(key)
+            return
+        data = staging.inline_json(conn.s.out_dir, path)
+        message = {'type': 'roads_tile', 'anchorId': aid, 'key': f's{key[0]}_{key[1]}',
+                   'path': path, 'n': n}
+        if data is not None:
+            message['data'] = data
+        pool = getattr(conn.s, 'pool_shapes', None)
+        if pool is not None and data is not None:
+            # Old optional mesh files may remain on disk after an empty replacement.
+            # Pool only the fields in this tile, never those stale files.
+            files = {k: v for k, v in shape_files(aid, *key).items() if k in data}
+            slots = pool(conn, files)
+            if slots:
+                message['slots'] = slots
+        conn.send(message)
+        self.sent.add(key)
+        self.stale.discard(key)

@@ -1,0 +1,825 @@
+"""vegetation: tree tops from a canopy height model (one per crown, the tallest), never on buildings or roads,
+deterministic; tiles of items in the anchor frame."""
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import geodesy  # noqa: E402
+import mapcells  # noqa: E402
+import vegetation as veg  # noqa: E402
+
+LAT, LON = 39.29, -76.58
+KEY = mapcells.cell_of(LAT, LON)
+
+
+class Raster:
+    def __init__(self, data, x0, y0, dx, nodata=None):
+        self.data, self.x0, self.y0, self.dx, self.dy, self.nodata = data, x0, y0, dx, dx, nodata
+
+    def sample(self, lon, lat):
+        return np.full(np.shape(lon), 30, np.uint8)        # grass everywhere
+
+
+class Feats:
+    """mapgeom.Features' fields the vegetation reads: one part of one ring per feature."""
+
+    def __init__(self, kind, rows, cls=None):
+        self.kind = np.full(len(rows), kind, np.uint8)
+        self.rows = rows
+        self.attrs = {"class": np.array(cls or [""] * len(rows), object)}
+        self.lonlat = np.concatenate([np.asarray(r, np.float64) for r in rows]) if rows else np.zeros((0, 2))
+        self.coord_off = np.cumsum([0] + [len(r) for r in rows]).astype(np.int64)
+        self.ring_off = np.arange(len(rows) + 1, dtype=np.int64)
+        self.part_off = np.arange(len(rows) + 1, dtype=np.int64)
+
+    def parts(self, i):
+        return [[np.asarray(self.rows[i], np.float64)]]
+
+
+def cell_data():
+    """A cell whose canopy has three crowns: one free, one under a building, one on a road."""
+    lon0, lat0, lon1, lat1 = KEY.bounds()
+    x0, y1 = veg._to3857(lon0, lat1)
+    x1, y0 = veg._to3857(lon1, lat0)
+    dx = (x1 - x0) / 512
+    h = np.zeros((512, 512), np.uint8)
+    yy, xx = np.mgrid[0:512, 0:512]
+    crowns = [(100, 100), (300, 300), (100, 400)]          # (row, col)
+    for r, c in crowns:
+        h = np.maximum(h, np.clip(15 - np.hypot(yy - r, xx - c), 0, 15).astype(np.uint8))
+    chm = Raster(h, x0, y1, dx, nodata=255)
+
+    def lonlat(r, c):
+        return veg._to4326(x0 + (c + 0.5) * dx, y1 - (r + 0.5) * dx)
+
+    def square(r, c, half):
+        pts = [lonlat(r - half, c - half), lonlat(r - half, c + half), lonlat(r + half, c + half),
+               lonlat(r + half, c - half), lonlat(r - half, c - half)]
+        return [(float(a), float(b)) for a, b in pts]
+    building = Feats(3, [square(300, 300, 6)])
+    a, b = lonlat(100, 380), lonlat(100, 420)
+    road = Feats(2, [[(float(a[0]), float(a[1])), (float(b[0]), float(b[1]))]], ["residential"])
+    layers = {"canopy": chm, "landcover": Raster(None, 0, 0, 1), "buildings": building, "roads": road,
+              "water": Feats(3, [])}
+    return SimpleNamespace(bounds=KEY.bounds(), layers=layers), crowns, lonlat
+
+
+class FakeMapData:
+    release = "t"
+
+    def __init__(self):
+        self.cd, self.crowns, self.lonlat = cell_data()
+
+    def cell(self, key, layers=None, kind="demand"):
+        if tuple(key)[1:] == (KEY.x, KEY.y):
+            return self.cd
+        empty = SimpleNamespace(bounds=None, layers={"buildings": None, "roads": None, "water": None})
+        return empty
+
+
+class VegetationTest(unittest.TestCase):
+    def test_one_tree_per_free_crown(self):
+        md = FakeMapData()
+        it = veg.Vegetation(md, None).cell(KEY)
+        trees = it.take(it.kind == veg.KIND_TREE)
+        self.assertEqual(len(trees), 2, "the building's crown is left out, the road's moves off the road")
+        lon, lat = md.lonlat(100, 100)
+        free = np.argmin(abs(trees.lon - lon) * 85000 + abs(trees.lat - lat) * 111000)
+        self.assertLess(abs(trees.lon[free] - lon) * 85000 + abs(trees.lat[free] - lat) * 111000, 4.0)
+        self.assertGreaterEqual(trees.height[free], 12.0)
+        rlon, rlat = md.lonlat(100, 400)                   # on the residential road's centreline
+        street = 1 - free
+        off = abs(trees.lat[street] - rlat) * 111000
+        curb = veg.ROAD_HALF_WIDTH_M["residential"] + veg.TREE_PIT_M + 0.6     # a tree pit just past the curb
+        self.assertGreater(off, curb - 1.0, "beside the road")
+        self.assertLess(off, curb + 3.0)                   # (whole CHM pixels, ~2 m here)
+
+    def test_a_wider_drawn_road_pushes_its_tree_further(self):
+        md = FakeMapData()
+        v = veg.Vegetation(md, None)
+        v._specs = lambda f: [SimpleNamespace(width=16.0)] * len(f.kind)     # drawn 16 m wide (parking lanes)
+        it = v.cell(KEY)
+        trees = it.take(it.kind == veg.KIND_TREE)
+        rlon, rlat = md.lonlat(100, 400)
+        off = (np.hypot((trees.lon - rlon) * 85000, (trees.lat - rlat) * 111000)).min()
+        self.assertGreater(off, 8.0 + veg.TREE_PIT_M, "past the drawn curb, not the class's")
+
+    def test_its_sidewalks_kept_clear_too(self):
+        # GitHub #424 / #425: the canopy's trees and the bushes stood on the sidewalks; a street tree (a top over the
+        # road) still lands in a pit at the curb
+        import roads as roadsmod
+        md = FakeMapData()
+        v = veg.Vegetation(md, None)
+        v._specs = lambda f: [SimpleNamespace(width=8.0, walk=6.0)] * len(f.kind)
+        orig = roadsmod.has_sidewalks
+        roadsmod.has_sidewalks = lambda sp: True
+        try:
+            it = v.cell(KEY)
+        finally:
+            roadsmod.has_sidewalks = orig
+        trees = it.take(it.kind == veg.KIND_TREE)
+        self.assertEqual(len(trees), 2, "the street tree kept")
+        rlon, rlat = md.lonlat(100, 400)
+        off = np.hypot((trees.lon - rlon) * 85000, (trees.lat - rlat) * 111000).min()
+        self.assertLess(off, 4.0 + veg.TREE_PIT_M + 0.6 + 4.0, "in a pit by the curb (whole CHM pixels), not past it")
+
+    def test_footway_keeps_its_tree(self):
+        md = FakeMapData()
+        md.cd.layers["roads"].attrs["class"][:] = "footway"   # a sidewalk mapped as a line: street trees stand on it
+        it = veg.Vegetation(md, None).cell(KEY)
+        trees = it.take(it.kind == veg.KIND_TREE)
+        rlon, rlat = md.lonlat(100, 400)
+        self.assertLess((np.hypot((trees.lon - rlon) * 85000, (trees.lat - rlat) * 111000)).min(), 4.0)
+
+    def test_deterministic(self):
+        a = veg.Vegetation(FakeMapData(), None).cell(KEY)
+        b = veg.Vegetation(FakeMapData(), None).cell(KEY)
+        for f in ("lon", "lat", "height", "kind", "group", "rank", "yaw", "scale"):
+            np.testing.assert_array_equal(getattr(a, f), getattr(b, f))
+
+    def test_thin_keeps_the_tallest(self):
+        jj = np.array([10, 10, 11, 40])          # crown radius of the 14 m top: 0.5 (0.12 h + 1) / 1.2 = 1.1 px
+        ii = np.array([12, 12, 12, 40])
+        h = np.array([10.0, 14.0, 9.0, 8.0])
+        kj, ki = veg._thin(jj, ii, h, 1.2)
+        self.assertEqual(sorted(zip(kj.tolist(), ki.tolist())), [(10, 12), (40, 40)])
+
+    def test_tile_items_in_the_anchor_frame(self):
+        md = FakeMapData()
+        v = veg.Vegetation(md, None)
+        f = geodesy.EnuFrame(LAT, LON)
+        items = v.cell(KEY)
+        e, n, _ = f.geodetic_to_enu(items.lat, items.lon, np.zeros(len(items)))
+        tx, ty = int(np.floor(e[0] / veg.TILE)), int(np.floor(n[0] / veg.TILE))
+        rows = veg.tile_items(f, tx, ty, v, lambda k: True, lambda la, lo: np.full(np.shape(la), 12.0))
+        self.assertTrue(rows)
+        g, x, y, z, yaw, sc, hgt, rank = rows[0]
+        self.assertTrue(tx * veg.TILE <= x < (tx + 1) * veg.TILE and ty * veg.TILE <= y < (ty + 1) * veg.TILE)
+        self.assertAlmostEqual(z, float(f.geodetic_to_enu(items.lat[:1], items.lon[:1], np.array([12.0]))[2][0]),
+                               delta=0.5)
+
+
+    def test_tile_ambience(self):
+        # the forest ambience (the mod's ambience.lua): the tile's trees and bushes in AUDIO_CELL_M squares, each node
+        # [x, y, z, depth, size, count] inside the tile, every sounding item counted once; Baltimore's set temperate
+        md = FakeMapData()
+        v = veg.Vegetation(md, None)
+        f = geodesy.EnuFrame(LAT, LON)
+        items = v.cell(KEY)
+        e, n, _ = f.geodetic_to_enu(items.lat, items.lon, np.zeros(len(items)))
+        tx, ty = int(np.floor(e[0] / veg.TILE)), int(np.floor(n[0] / veg.TILE))
+        ground = lambda la, lo: np.full(np.shape(la), 12.0)        # noqa: E731
+        js = veg.tile_items(f, tx, ty, v, lambda k: True, ground, as_json=True)
+        rows = veg.tile_items(f, tx, ty, v, lambda k: True, ground)
+        a = np.array(js.audio).reshape(-1, 6)
+        self.assertGreater(len(a), 0)
+        self.assertEqual(int(a[:, 5].sum()), sum(1 for r in rows if r[0] in veg.AUDIO_SOUND))
+        self.assertTrue(((a[:, 0] >= tx * veg.TILE) & (a[:, 0] < (tx + 1) * veg.TILE)).all())
+        self.assertTrue(((a[:, 4] >= 0) & (a[:, 4] <= 1)).all() and (a[:, 3] >= 0).all())
+        self.assertEqual(js.biome, [0, 0])
+        empty = veg.tile_items(f, tx + 40, ty + 40, v, lambda k: True, ground, as_json=True)
+        self.assertEqual((empty, empty.audio), ("[]", []))         # (no items: still its set)
+        self.assertEqual(empty.biome, [0, 0])
+
+    def test_dense_tile_sends_its_lowest_ranks(self):
+        # GitHub #66: Bodø's forest tiles held 10-20k items each; a tile sends TILE_ROWS_MAX at most, the lowest ranks
+        md = FakeMapData()
+        v = veg.Vegetation(md, None)
+        f = geodesy.EnuFrame(LAT, LON)
+        items = v.cell(KEY)
+        e, n, _ = f.geodetic_to_enu(items.lat, items.lon, np.zeros(len(items)))
+        tx, ty = int(np.floor(e[0] / veg.TILE)), int(np.floor(n[0] / veg.TILE))
+        ground = lambda la, lo: np.full(np.shape(la), 12.0)        # noqa: E731
+        full = veg.tile_items(f, tx, ty, v, lambda k: True, ground)
+        self.assertGreater(len(full), 20)
+        old = veg.TILE_ROWS_MAX
+        veg.TILE_ROWS_MAX = 10
+        try:
+            capped = veg.tile_items(f, tx, ty, v, lambda k: True, ground)
+        finally:
+            veg.TILE_ROWS_MAX = old
+        self.assertEqual(len(capped), 10)
+        lowest = sorted(r[7] for r in full)[:10]
+        self.assertEqual(sorted(r[7] for r in capped), lowest)
+        self.assertEqual([r for r in full if r in capped], capped, "in the tile's own order")
+
+
+    def test_rocks_on_bare_ground_follow_its_slope(self):
+        # the Bonneville Salt Flats had a rock every ~75 m2 (the user, 2026-10-20): none on flat bare ground
+        class Bare(Raster):
+            def sample(self, lon, lat):
+                return np.full(np.shape(lon), veg.WC["bare"], np.uint8)
+
+        class Ground:
+            def __init__(self, grade):
+                self.grade = grade
+
+            def sample(self, lat, lon, zoom):
+                return np.asarray(lat, np.float64) * 111320.0 * self.grade
+
+        def rocks(dem):
+            md = FakeMapData()
+            md.cd.layers["landcover"] = Bare(None, 0, 0, 1)
+            v = veg.Vegetation(md, None)
+            v.dem = dem
+            it = v.cell(KEY)
+            return int(np.isin(it.group, (veg.G_ROCK, veg.G_DESERT_ROCK)).sum()), len(it)
+        none, _ = rocks(None)
+        self.assertGreater(none, 100)
+        flat, n_flat = rocks(Ground(0.0))
+        self.assertEqual(flat, 0, "a salt pan: bare")
+        steep, _ = rocks(Ground(0.2))
+        self.assertEqual(steep, none, "a slope over ROCK_SLOPE: every rock")
+        some, _ = rocks(Ground(0.06))
+        self.assertTrue(0 < some < none, "half way: some")
+
+
+    def test_no_canopy_trees_on_barren_ground(self):
+        # the canopy map misread the Bonneville Salt Flats' bright salt as ~19k trees up to 21 m: on bare ground with no
+        # vegetated land within BARREN_NEAR_M, its tops are dropped
+        class Cover(Raster):
+            def sample(self, lon, lat):
+                return np.full(np.shape(lon), self.data, np.uint8)
+        md = FakeMapData()
+        md.cd.layers["landcover"] = Cover(veg.WC["bare"], 0, 0, 1)
+        it = veg.Vegetation(md, None).cell(KEY)
+        self.assertEqual(int((it.kind == veg.KIND_TREE).sum()), 0)
+        md.cd.layers["landcover"] = Cover(veg.WC["grass"], 0, 0, 1)
+        self.assertGreater(int((veg.Vegetation(md, None).cell(KEY).kind == veg.KIND_TREE).sum()), 0, "on grass: kept")
+
+
+class LatitudeTest(unittest.TestCase):
+    """The canopy raster and the scatter grids are in Web Mercator units: the same pixels cover cos(lat) as much ground.
+    A flat forest at 69 N had ~4.5x the trees per km2 of the same forest at 39 N, and its flat crowns' tops stood on a
+    lattice (a player's Lapland report, 2026-11-14). Now about the same density, and no lattice."""
+
+    @staticmethod
+    def density(lat, lon, dx):
+        key = mapcells.cell_of(lat, lon)
+        lon0, lat0, lon1, lat1 = key.bounds()
+        cx, cy = veg._to3857((lon0 + lon1) / 2, (lat0 + lat1) / 2)
+        n = 360                                                   # (a window of the cell: the real raster's pixels)
+        x0, y1 = cx - n * dx / 2, cy + n * dx / 2
+        h = np.full((n, n), 12, np.uint8)                         # one flat 12 m forest (an upsampled canopy's plateau)
+
+        class Trees(Raster):
+            def sample(self, lon, lat):
+                return np.full(np.shape(lon), 10, np.uint8)      # WorldCover tree cover
+
+        layers = {"canopy": Raster(h, x0, y1, dx, nodata=255), "landcover": Trees(None, 0, 0, 1),
+                  "buildings": Feats(3, []), "roads": Feats(2, []), "water": Feats(3, [])}
+        cd = SimpleNamespace(bounds=key.bounds(), layers=layers)
+
+        class MD:
+            release = "t"
+
+            def cell(self, k, layers=None, kind="demand"):
+                if tuple(k)[1:] == (key.x, key.y):
+                    return cd
+                return SimpleNamespace(bounds=None, layers={"buildings": None, "roads": None, "water": None})
+        it = veg.Vegetation(MD(), None).cell(key)
+        trees = it.take(it.kind == veg.KIND_TREE)
+        km2 = (n * dx * np.cos(np.radians((lat0 + lat1) / 2)) / 1000.0) ** 2   # the window's ground area
+        return len(trees) / km2, trees
+
+    def test_same_density_at_69_n_as_at_39_n(self):
+        dx = 1.194                                                # (the z17 canopy raster's pixel: the same at both)
+        d39, _ = self.density(39.29, -76.58, dx)
+        d69, trees = self.density(69.0127, 28.6714, dx)
+        self.assertGreater(d39, 0)
+        self.assertLess(d69 / d39, 1.6, (d39, d69))
+        self.assertGreater(d69 / d39, 0.6, (d39, d69))
+        # no lattice: the tops of a flat crown were kept in the raster's order, rows and columns at one spacing
+        lat = np.asarray(trees.lat)
+        rows = np.unique(np.round((lat - lat.min()) * 1e5).astype(np.int64))
+        self.assertGreater(len(rows), len(lat) ** 0.5 * 1.5, "tops on few rows: a lattice")
+
+    def test_merc_k(self):
+        self.assertAlmostEqual(veg._merc_k(veg.MERC_REF_LAT), 1.0, places=9)
+        self.assertAlmostEqual(veg._merc_k(69.0), 2.137, places=2)
+        self.assertAlmostEqual(veg._merc_k(-69.0), veg._merc_k(69.0), places=12)
+
+
+class RegionalTest(unittest.TestCase):
+    def g(self, group, h, lat, lon, lcls, u=0.9):
+        return int(veg.regional(np.array([group]), np.array([h]), np.array([lat]), np.array([lon]),
+                                np.array([lcls]), np.array([u]))[0])
+
+    def test_regions(self):
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 12, 39.3, -76.6, 10), veg.G_DECIDUOUS, "the east keeps its trees")
+        self.assertEqual(self.g(veg.G_CONIFER, 20, 37.7, -119.6, 10), veg.G_PINE_WEST, "Sierra conifers: pines")
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 5, 38.6, -109.5, 20), veg.G_JUNIPER, "Moab scrub trees: junipers")
+        self.assertEqual(self.g(veg.G_ROCK, 1, 38.6, -109.5, 60), veg.G_DESERT_ROCK)
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 25.8, -80.2, 50, u=0.1), veg.G_PALM, "Miami street trees")
+        # GitHub #110: Houston and Austin are live oaks and loblolly pines, few palms; the Rio Grande Valley's are palms
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 29.76, -95.37, 50, u=0.1), veg.G_DECIDUOUS, "Houston street trees")
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 30.27, -97.74, 50, u=0.3), veg.G_DECIDUOUS, "Austin")
+        self.assertEqual(self.g(veg.G_CONIFER, 20, 30.3, -95.5, 10), veg.G_PINE_WEST, "East Texas pines")
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 26.2, -98.2, 50, u=0.1), veg.G_PALM, "McAllen street trees")
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 25.8, -80.2, 50, u=0.9), veg.G_DECIDUOUS)
+
+    def test_mediterranean(self):
+        """The Mediterranean basin's Cs climates take Italy's trees (holm / cork oaks, olives, maritime pines,
+        cypresses) for most broadleaves and conifers; Munich and California keep theirs."""
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 41.9, 12.5, 50, u=0.5), veg.G_MEDITERRANEAN, "Rome")
+        self.assertEqual(self.g(veg.G_CONIFER, 15, 43.3, 5.37, 10, u=0.5), veg.G_MEDITERRANEAN, "Marseille")
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 41.9, 12.5, 10, u=0.95), veg.G_DECIDUOUS, "a share stays")
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 48.14, 11.58, 50, u=0.1), veg.G_DECIDUOUS, "Munich")
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 9, 34.05, -118.25, 10, u=0.5), veg.G_OAK_WEST, "California")
+        self.assertEqual(self.g(veg.G_SHRUB, 1, 41.9, 12.5, 10, u=0.1), veg.G_SHRUB, "bushes are not trees")
+
+    def test_more_regional_trees(self):
+        """2026-11-10 asset survey: Australia's eucalypts, temperate Europe's riverside poplars, the Mojave's creosote."""
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 15, -35.3, 149.1, 10, u=0.5), veg.G_EUCALYPTUS, "Canberra")
+        self.assertEqual(self.g(veg.G_CONIFER, 20, -37.8, 145.0, 10, u=0.95), veg.G_CONIFER, "a share stays (pines)")
+        self.assertEqual(self.g(veg.G_DECIDUOUS, 15, -12.4, 130.8, 10, u=0.5), veg.G_EUCALYPTUS, "Darwin's savanna")
+
+        def rip(lat, lon, group=veg.G_DECIDUOUS, u=0.2, near=True):
+            return int(veg.regional(np.array([group]), np.array([18.0]), np.array([lat]), np.array([lon]),
+                                    np.array([10]), np.array([u]), riparian=np.array([near]))[0])
+        self.assertEqual(rip(47.4, 0.7), veg.G_POPLAR, "the Loire's banks")
+        self.assertEqual(rip(47.4, 0.7, near=False), veg.G_DECIDUOUS, "away from water")
+        self.assertEqual(rip(47.4, 0.7, u=0.6), veg.G_DECIDUOUS, "a share only")
+        self.assertEqual(rip(47.4, 0.7, group=veg.G_CONIFER), veg.G_CONIFER, "broadleaves only")
+        self.assertEqual(rip(39.3, -76.6), veg.G_DECIDUOUS, "not in America")
+        self.assertEqual(self.g(veg.G_SHRUB, 1, 35.0, -116.0, 20, u=0.3), veg.G_CREOSOTE, "the Mojave")
+        self.assertEqual(self.g(veg.G_SHRUB, 1, 38.6, -109.5, 20, u=0.3), veg.G_DESERT_SHRUB, "Moab: cold desert")
+
+    def test_beyond_north_america(self):
+        """2026-10-15: Douglas firs in Punjab's fields; the Sahara's bushes were the East's."""
+        self.assertLess(float(veg._conifer_share(30.9, 75.8)), 0.1, "Punjab: hardly any conifers")
+        self.assertLess(float(veg._conifer_share(-1.3, 36.8)), 0.05, "Nairobi")
+        self.assertGreaterEqual(float(veg._conifer_share(43.0, 12.0)), 0.3, "Italy's pines")
+        self.assertGreaterEqual(float(veg._conifer_share(61.0, 10.0)), 0.6, "Norway")
+        self.assertEqual(float(veg._conifer_share(39.3, -76.6)), 0.2, "Maryland as before")
+        self.assertEqual(self.g(veg.G_SHRUB, 1, 22.3, -4.6, 60), veg.G_DESERT_SHRUB, "the Sahara")
+        self.assertEqual(self.g(veg.G_ROCK, 1, -25.0, 133.0, 20), veg.G_DESERT_ROCK, "inner Australia")
+        self.assertEqual(self.g(veg.G_SHRUB, 1, 52.0, 5.0, 20), veg.G_SHRUB, "Dutch shrubland: no desert")
+
+
+class DilateTest(unittest.TestCase):
+    def test_grows_by_r_in_both_axes(self):
+        m = np.zeros((9, 9), bool)
+        m[4, 4] = True
+        d = veg._dilate(m, 2)
+        self.assertEqual(int(d.sum()), 25)
+        self.assertTrue(d[2:7, 2:7].all())
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class RockSinkTest(unittest.TestCase):
+    def test_rocks_sink_into_slopes_trees_do_not(self):
+        # a 45-degree hillside rising to the east (z = e): a 2 m rock sinks ROCK_SINK of its height, a tree stays
+        f = geodesy.EnuFrame(LAT, LON)
+        e = np.array([10.0, 20.0, 30.0]); n = np.zeros(3)
+        la, lo, _ = f.enu_to_geodetic(e, n, np.zeros(3))
+        it = veg.Items(lo, la, np.array([2.0, 2.0, 15.0]), np.ones(3), np.zeros(3, np.uint8),
+                       np.array([veg.G_ROCK, veg.G_DESERT_ROCK, veg.G_CONIFER], np.uint8), np.zeros(3), np.zeros(3),
+                       np.ones(3))
+
+        def elev(lat, lon):
+            x, _, _ = f.geodetic_to_enu(np.asarray(lat), np.asarray(lon), np.zeros(np.size(lat)))
+            return np.asarray(x, np.float64)
+        z = veg._sink_rocks(f, it, e, n, e.copy(), elev)
+        self.assertAlmostEqual(z[0], 10.0 - veg.ROCK_SINK * 2.0, delta=0.02)
+        self.assertAlmostEqual(z[1], 20.0 - veg.ROCK_SINK * 2.0, delta=0.02)
+        self.assertEqual(z[2], 30.0)
+        flat = veg._sink_rocks(f, it, e, n, np.zeros(3), lambda la, lo: np.zeros(np.size(la)))
+        self.assertTrue(np.allclose(flat, 0.0, atol=0.02), "no sinking on flat ground")
+
+
+class GradedFaceTest(unittest.TestCase):
+    def test_no_tree_on_a_cutting_rocks_stay(self):
+        """A road cut 3 m into a slope (Mount Washington, Pittsburgh): the tree and the bush on its face go, a tree
+        0.5 m off the DEM stays, and a rock on the face stays (sunk into it)."""
+        g = np.array([veg.G_DECIDUOUS, veg.G_SHRUB, veg.G_CONIFER, veg.G_ROCK], np.uint8)
+        it = veg.Items(np.zeros(4), np.arange(4.0), np.full(4, 10.0), np.ones(4), np.zeros(4, np.uint8), g,
+                       np.zeros(4), np.zeros(4), np.ones(4))
+        zg = np.array([97.0, 98.0, 99.5, 97.0])        # graded
+        raw = lambda la, lo: np.full(np.size(la), 100.0)    # noqa: E731
+        it2, e2, n2, z2 = veg._off_graded(it, np.arange(4.0), np.zeros(4), zg, raw)
+        self.assertEqual(list(it2.group), [veg.G_CONIFER, veg.G_ROCK])
+        self.assertEqual(list(e2), [2.0, 3.0])
+        self.assertEqual(list(z2), [99.5, 97.0])
+        same = veg._off_graded(it, np.arange(4.0), np.zeros(4), zg, None)
+        self.assertEqual(len(same[0]), 4, "no raw ground: all kept")
+
+
+class FlatTileTest(unittest.TestCase):
+    """A vegetation tile as one flat array (the mod's hello.vegFlat): no table per item in the game's Lua (trees.lua)."""
+
+    def test_flat_json(self):
+        import json
+        rows = [[0, 1.5, -2.25, 3.0, 90.0, 1.0, 12.0, 0.5], [3, -0.0, 4.0, 5.5, -45.5, 0.8, 2.0, 0.0001]]
+        js = veg.JsonRows(json.dumps(rows, separators=(",", ":")))
+        js.n = 2
+        self.assertEqual(veg.flat_json(rows), json.dumps([v for r in rows for v in r], separators=(",", ":")))
+        self.assertEqual(veg.flat_json(js), veg.flat_json(rows))
+        self.assertEqual(json.loads(veg.flat_json(js)), [v for r in rows for v in r])
+        one = veg.JsonRows(json.dumps(rows[:1], separators=(",", ":")))
+        self.assertEqual(json.loads(veg.flat_json(one)), rows[0])
+        self.assertEqual(veg.flat_json([]), "[]")
+        self.assertEqual(veg.flat_json(veg.JsonRows("[]")), "[]")
+
+    def test_write_tile_both_formats(self):
+        import json
+        import os
+        import tempfile
+        rows = [[1, 10.0, 20.0, 30.0, 0.0, 1.0, 15.0, 0.25]] * 3
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(veg.write_tile(tmp, "/v", 7, -1, 2, rows), ("/v/veg_7_-1_2.json", 3))
+            self.assertEqual(veg.write_tile(tmp, "/v", 7, -1, 2, rows, flat=True), ("/v/veg_7_-1_2.flat.json", 3))
+            with open(os.path.join(tmp, "veg_7_-1_2.json")) as fh:
+                old = json.load(fh)
+            with open(os.path.join(tmp, "veg_7_-1_2.flat.json")) as fh:
+                new = json.load(fh)
+        self.assertEqual(old, {"groups": list(veg.GROUPS), "items": rows})        # an older mod's: unchanged
+        self.assertEqual(new, {"groups": list(veg.GROUPS), "stride": veg.FLAT_STRIDE, "flat": rows[0] * 3})
+        self.assertEqual(veg.FLAT_STRIDE, len(rows[0]))
+
+
+class FlatHelloTest(unittest.TestCase):
+    """The connection builds its vegetation tiles flat only for a mod whose hello says it reads them (vegFlat)."""
+
+    def run_hello(self, extra):
+        import test_server
+        h = test_server.ServerHarness()
+        h.setUp()
+        try:
+            asked = []
+            h.server.build_veg_tile = lambda aid, tx, ty, flat=False: asked.append(flat)
+            h.c.send(dict({"type": "hello", "protocol": 4, "format": h.MOD_FORMAT, "modVersion": "0.4.0"}, **extra))
+            h.c.until(lambda m: m["type"] == "hello", timeout=10)
+            h.conn().build_veg_tile(1, 0, 0)
+            return h.conn().veg_flat, asked
+        finally:
+            h.tearDown()
+
+    def test_vegflat_hello(self):
+        self.assertEqual(self.run_hello({"vegFlat": True}), (True, [True]))
+
+    def test_older_mod_gets_rows(self):
+        self.assertEqual(self.run_hello({}), (False, [False]))
+        self.assertEqual(self.run_hello({"vegFlat": "yes"}), (False, [False]))      # (only a JSON true)
+
+
+class DemFailedTest(unittest.TestCase):
+    """A cell built while the DEM could not answer is not kept on disk (from PR #295): its slope rocks were missing for
+    good."""
+
+    def test_failed_dem_cell_not_cached(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            v = veg.Vegetation(None, cache_dir=tmp)
+            v._path = lambda x, y: os.path.join(tmp, f"{x}_{y}.npz")
+
+            def build(x, y, fail):
+                v._tl.dem_failed = fail
+                return veg.Items(*(np.zeros(0) for _ in range(9)))
+            v._build = lambda x, y: build(x, y, True)
+            v._load(1, 2)
+            self.assertFalse(os.path.exists(v._path(1, 2)), "a failed DEM: not kept")
+            v._build = lambda x, y: build(x, y, False)
+            v._load(1, 2)
+            self.assertTrue(os.path.exists(v._path(1, 2)), "answered: kept")
+
+
+class ClumpTest(unittest.TestCase):
+    """GitHub #1074: a forest square's trees get one far clump item; they are flagged (negative scale)."""
+
+    def _items(self, lat, lon, group, lcls=10):
+        n = len(lat)
+        f32 = lambda v: np.full(n, v, np.float32)       # noqa: E731
+        it = veg.Items(np.asarray(lon, float), np.asarray(lat, float), f32(20.0), f32(3.4),
+                       np.full(n, veg.KIND_TREE, np.uint8), np.asarray(group, np.uint8),
+                       np.linspace(0.1, 0.9, n).astype(np.float32), f32(0.0), f32(1.0))
+        return it, np.full(n, lcls, np.uint8)
+
+    def test_a_dense_square_becomes_one_clump(self):
+        cell = veg.clump_cell(LAT)
+        # a square's corner (Web Mercator, from the world's edge): three firs in it, one fir alone two squares away
+        x0 = (np.floor((-8524000.0 + 20037508.342789244) / cell) + 0.5) * cell - 20037508.342789244
+        y0 = (np.floor((4764000.0 + 20037508.342789244) / cell) + 0.5) * cell - 20037508.342789244
+        xs = np.array([x0 - 2, x0 + 2, x0, x0 + 2 * cell])
+        ys = np.array([y0, y0 + 1, y0 - 2, y0])
+        lon, lat = veg._to4326(xs, ys)
+        it, lc = self._items(lat, lon, [veg.G_CONIFER, veg.G_CONIFER, veg.G_DECIDUOUS, veg.G_CONIFER])
+        out = veg.clumps(it, lc, LAT)
+        self.assertEqual(len(out), 5)
+        self.assertEqual(list(out.scale[:4] < 0), [True, True, True, False])
+        self.assertEqual(int(out.group[4]), veg.G_CONIFER_CLUMP, "most of them firs")
+        self.assertAlmostEqual(float(out.rank[4]), float(it.rank[:3].min()), places=6)
+        cx, cy = veg._to3857(out.lon[4:], out.lat[4:])
+        self.assertAlmostEqual(float(cx[0]), float(xs[:3].mean()), places=3)
+        self.assertAlmostEqual(float(cy[0]), float(ys[:3].mean()), places=3)
+        again = veg.clumps(it, lc, LAT)
+        self.assertTrue(np.array_equal(again.lon, out.lon) and np.array_equal(again.yaw, out.yaw), "deterministic")
+
+    def test_street_trees_and_palms_stay_single(self):
+        x0, y0 = -8524000.0, 4764000.0
+        lon, lat = veg._to4326(np.array([x0, x0 + 1, x0 + 2]), np.array([y0, y0 + 1, y0]))
+        it, lc = self._items(lat, lon, [veg.G_DECIDUOUS] * 3, lcls=veg.WC["built"])
+        self.assertEqual(len(veg.clumps(it, lc, LAT)), 3)
+        it, lc = self._items(lat, lon, [veg.G_PALM] * 3)
+        self.assertEqual(len(veg.clumps(it, lc, LAT)), 3)
+
+    def test_grid_fits_the_geotiles(self):
+        import geotiles
+        tile = 2 * np.pi * veg.R / (1 << geotiles.Z)
+        for lat in (0.0, 45.0, 60.0, 80.0):
+            k = tile / veg.clump_cell(lat)
+            self.assertAlmostEqual(k, round(k), places=9)
+            self.assertTrue(10 <= veg.clump_cell(lat) * np.cos(np.radians(lat)) <= 27)
+
+    def test_clumps_beside_the_tile_cap(self):
+        n = 30
+        it = veg.Items(*(np.zeros(n) for _ in range(4)), np.zeros(n, np.uint8),
+                       np.array([veg.G_CONIFER] * 20 + [veg.G_CONIFER_CLUMP] * 10, np.uint8),
+                       np.linspace(0, 1, n).astype(np.float32)[::-1].copy(), np.zeros(n), np.ones(n))
+        old = veg.TILE_ROWS_MAX, veg.CLUMP_ROWS_MAX
+        veg.TILE_ROWS_MAX, veg.CLUMP_ROWS_MAX = 5, 3
+        try:
+            keep = veg._capped(it)
+        finally:
+            veg.TILE_ROWS_MAX, veg.CLUMP_ROWS_MAX = old
+        self.assertEqual(int(np.sum(it.group[keep] == veg.G_CONIFER)), 5)
+        self.assertEqual(int(np.sum(it.group[keep] == veg.G_CONIFER_CLUMP)), 3)
+        self.assertTrue(np.all(np.diff(keep) > 0))
+
+
+class WarmTest(unittest.TestCase):
+    """warm_around runs on the event loop at every pose: it only keeps the place there. The warm thread checks the
+    cells' files, each once, and builds the missing ones nearest first (up to 64 file checks a pose held the loop on a
+    busy hard drive, GitHub #1054)."""
+
+    def test_file_checks_on_the_warm_thread_once_per_cell(self):
+        import collections
+        import math
+        import os
+        import tempfile
+        import threading
+        import time
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            v = veg.Vegetation(None, cache_dir=tmp)
+            v._path = lambda x, y: os.path.join(tmp, f"{x}_{y}.npz")
+            built = []
+
+            def load(x, y):
+                built.append((x, y))
+                open(v._path(x, y), "wb").close()
+                return veg.Items(*(np.zeros(0) for _ in range(9)))
+            v._load = load
+            checks, threads, real = collections.Counter(), set(), os.path.exists
+
+            def exists(p):
+                if str(p).startswith(tmp):
+                    checks[p] += 1
+                    threads.add(threading.get_ident())
+                return real(p)
+            d = veg.WARM_M / 111320.0
+            dl = d / math.cos(math.radians(LAT))
+            cells = {(k.x, k.y) for k in mapcells.cells_for_bbox(LAT - d, LON - dl, LAT + d, LON + dl)}
+            with mock.patch.object(veg.os.path, "exists", exists):
+                for _ in range(10):                     # poses
+                    v.warm_around(LAT, LON)
+                for _ in range(1000):
+                    if set(built) >= cells and v._warm_at is None:
+                        break
+                    time.sleep(0.01)
+                time.sleep(0.2)                         # (the warm thread idle)
+                self.assertEqual(set(built), cells)
+                self.assertEqual(len(built), len(cells), "each built once")
+                self.assertEqual(built[0], (KEY.x, KEY.y), "nearest first")
+                self.assertNotIn(threading.get_ident(), threads, "warm_around checks no file itself")
+                with v._lock:
+                    v._mem.clear()                      # (out of memory: found on disk)
+                n = sum(checks.values())
+                for _ in range(20):
+                    self.assertEqual(v._warm_cells(LAT, LON, veg.WARM_M), [])
+                self.assertEqual(sum(checks.values()), n + len(cells), "each cell's file checked once in 20 places")
+
+
+class OrchardTest(unittest.TestCase):
+    def _ring(self, frame, e0, e1, n0, n1):
+        e = np.array([e0, e1, e1, e0, e0], float)
+        n = np.array([n0, n0, n1, n1, n0], float)
+        la, lo, _ = frame.enu_to_geodetic(e, n, np.zeros(5))
+        return np.stack([lo, la], 1)
+
+    def _feats(self, parts):
+        """One orchard feature; parts: [(outer ring, [hole rings])] (lon / lat)."""
+        import mapgeom
+        feats = mapgeom.build("land_use", np.array(["orch-1"]),
+                              [(mapgeom.POLYGON, [[outer, *holes] for outer, holes in parts])])
+        feats.attrs["class"] = np.array(["orchard"], object)
+        return feats
+
+    def _chm(self, rings, pad=40.0, dx=2.0):
+        xy = np.vstack([np.column_stack(veg._to3857(r[:, 0], r[:, 1])) for r in rings])
+        x0, y1 = float(xy[:, 0].min()) - pad, float(xy[:, 1].max()) + pad
+        cols = int(np.ceil((float(xy[:, 0].max()) + pad - x0) / dx))
+        rows = int(np.ceil((y1 - (float(xy[:, 1].min()) - pad)) / dx))
+        return Raster(np.zeros((rows, cols), np.uint8), x0, y1, dx)
+
+    def _mask_at(self, frame, chm, mask, e, n):
+        la, lo, _ = frame.enu_to_geodetic(np.asarray([e], float), np.asarray([n], float), np.zeros(1))
+        x, y = veg._to3857(lo, la)
+        c = int(np.floor((x[0] - chm.x0) / chm.dx))
+        r = int(np.floor((chm.y0 - y[0]) / chm.dy))
+        return bool(mask[r, c])
+
+    def test_trees_stand_in_lines(self):
+        for lat0 in (48.8, 40.0):           # Leonberg, and a second latitude: the same ground density
+            with self.subTest(lat=lat0):
+                frame = geodesy.EnuFrame(lat0, -76.0)
+                ring = self._ring(frame, -40, 40, -20, 20)
+                feats = self._feats([(ring, [])])
+                chm = self._chm([ring])
+                items = veg.orchard_items(feats, chm, np.zeros(chm.data.shape, bool), None)
+                self.assertGreaterEqual(len(items), 300, "rows 2.5 m by 3 m on the ground: 80 x 40 m holds ~427")
+                self.assertLessEqual(len(items), 560)
+                density = len(items) / (80.0 * 40.0)
+                self.assertTrue(0.10 <= density <= 0.17, density)
+                self.assertTrue(np.all(items.kind == veg.KIND_TREE))
+                self.assertTrue(np.all((items.height >= 4.2) & (items.height <= 6.5)))
+                yaw = (np.asarray(items.yaw) + 180.0) % 360.0 - 180.0
+                self.assertLess(float(np.max(np.abs(yaw))), 16.0, "one row direction")
+                _, nn, _ = frame.geodetic_to_enu(items.lat, items.lon, np.zeros(len(items)))
+                order = np.sort(np.asarray(nn))
+                nlines = 1 + int(np.sum(np.diff(order) > 1.2))
+                self.assertTrue(10 <= nlines <= 16, nlines)
+                blocked = np.ones(chm.data.shape, bool)
+                self.assertEqual(len(veg.orchard_items(feats, chm, blocked, None)), 0)
+                half = np.zeros(chm.data.shape, bool)
+                centres = chm.x0 + (np.arange(chm.data.shape[1]) + 0.5) * chm.dx
+                half[:, centres < chm.x0 + chm.data.shape[1] * chm.dx / 2] = True
+                kept = veg.orchard_items(feats, chm, half, None)
+                self.assertGreater(len(items), len(kept))
+                self.assertGreater(len(kept), 0)
+                xx, yy = veg._to3857(kept.lon, kept.lat)
+                c = np.floor((xx - chm.x0) / chm.dx).astype(np.int64)
+                r = np.floor((chm.y0 - yy) / chm.dy).astype(np.int64)
+                self.assertFalse(bool(half[r, c].any()))
+
+    def test_every_part_of_a_multipart_orchard_is_planted(self):
+        frame = geodesy.EnuFrame(48.8, -76.0)
+        west = self._ring(frame, -80, -20, -20, 20)
+        east = self._ring(frame, 20, 80, -20, 20)
+        feats = self._feats([(west, []), (east, [])])
+        chm = self._chm([west, east])
+        items = veg.orchard_items(feats, chm, np.zeros(chm.data.shape, bool), None)
+        e, _, _ = frame.geodetic_to_enu(items.lat, items.lon, np.zeros(len(items)))
+        self.assertGreater(int(np.sum(e < -20)), 0, "the first part is planted")
+        self.assertGreater(int(np.sum(e > 20)), 0, "the second part is planted too")
+        mask = np.zeros(chm.data.shape, bool)
+        veg._mask_polys(veg._orchard_mask_feats(feats), mask, chm, 0.0)
+        self.assertTrue(self._mask_at(frame, chm, mask, -50, 0), "canopy of the first part goes")
+        self.assertTrue(self._mask_at(frame, chm, mask, 50, 0), "canopy of the second part goes")
+        self.assertFalse(self._mask_at(frame, chm, mask, 0, 0), "the gap between them keeps its canopy")
+
+    def test_a_hole_keeps_its_canopy_and_gets_no_rows(self):
+        frame = geodesy.EnuFrame(48.8, -76.0)
+        outer = self._ring(frame, -40, 40, -30, 30)
+        hole = self._ring(frame, -10, 10, -10, 10)
+        feats = self._feats([(outer, [hole])])
+        chm = self._chm([outer])
+        items = veg.orchard_items(feats, chm, np.zeros(chm.data.shape, bool), None)
+        e, n, _ = frame.geodetic_to_enu(items.lat, items.lon, np.zeros(len(items)))
+        self.assertGreater(len(items), 0)
+        self.assertEqual(int(np.sum((np.abs(e) < 9) & (np.abs(n) < 9))), 0, "no tree in the hole")
+        mask = np.zeros(chm.data.shape, bool)
+        veg._mask_polys(veg._orchard_mask_feats(feats), mask, chm, 0.0)
+        self.assertFalse(self._mask_at(frame, chm, mask, 0, 0), "the hole keeps its canopy")
+        self.assertTrue(self._mask_at(frame, chm, mask, -30, 0), "the rest of the orchard loses it")
+
+    def test_a_small_orchard_keeps_its_crowns(self):
+        frame = geodesy.EnuFrame(48.8, -76.0)
+        small = self._ring(frame, -6, 6, -7.5, 7.5)             # 180 m2 on the ground
+        feats = self._feats([(small, [])])
+        chm = self._chm([small])
+        self.assertEqual(len(veg.orchard_items(feats, chm, np.zeros(chm.data.shape, bool), None)), 0)
+        self.assertIsNone(veg._orchard_mask_feats(feats))
+        big = self._ring(frame, -10, 10, -10, 10)               # 400 m2: just over the line
+        feats = self._feats([(big, [])])
+        chm = self._chm([big])
+        self.assertGreater(len(veg.orchard_items(feats, chm, np.zeros(chm.data.shape, bool), None)), 0)
+        mask = np.zeros(chm.data.shape, bool)
+        veg._mask_polys(veg._orchard_mask_feats(feats), mask, chm, 0.0)
+        self.assertTrue(self._mask_at(frame, chm, mask, 0, 0))
+
+
+class VineyardTest(unittest.TestCase):
+    def _field(self, e, n, cls="vineyard"):
+        import mapgeom
+        frame = geodesy.EnuFrame(44.9, -0.15)
+        la, lo, _ = frame.enu_to_geodetic(np.asarray(e, float), np.asarray(n, float), np.zeros(len(e)))
+        ring = np.stack([lo, la], 1)
+        feats = mapgeom.build("land_use", np.array(["vy-1"]), [(mapgeom.POLYGON, [[ring]])])
+        feats.attrs["class"] = np.array([cls], object)
+        x, y = veg._to3857(ring[:, 0], ring[:, 1])
+        pad, dx = 40.0, 2.0
+        x0, y1 = float(x.min()) - pad, float(y.max()) + pad
+        cols = int(np.ceil((float(x.max()) + pad - x0) / dx))
+        rows = int(np.ceil((y1 - float(y.min()) + pad) / dx))
+        return frame, feats, ring, Raster(np.zeros((rows, cols), np.uint8), x0, y1, dx), np.zeros((rows, cols), bool)
+
+    def test_rows_along_the_long_sides_inside_the_field(self):
+        # a parallelogram 200 m along x with 45-degree ends: its principal axis is skewed, its rows run along x
+        frame, feats, ring, chm, clear = self._field([0, 200, 260, 60, 0], [0, 0, 60, 60, 0])
+        it = veg.vineyard_items(feats, chm, clear, None)
+        self.assertGreater(len(it), 60)
+        self.assertTrue(np.all(it.group == veg.G_VINE))
+        yaw = np.asarray(it.yaw) % 180.0
+        self.assertTrue(np.all(np.minimum(yaw, 180.0 - yaw) < 0.5), "rows along the long sides")
+        from polygon import Path
+        x, y = veg._to3857(ring[:, 0], ring[:, 1])
+        path = Path(np.column_stack([x, y]))
+        cx, cy = veg._to3857(it.lon, it.lat)
+        k = (veg.VINE_ALONG_M / 2 - 1.0) / np.cos(np.radians(44.9))
+        for s in (-1, 1):
+            self.assertTrue(np.all(path.contains_points(np.column_stack([cx + s * k, cy]))), "both ends inside")
+        again = veg.vineyard_items(feats, chm, clear, None)
+        self.assertTrue(np.array_equal(again.lon, it.lon) and np.array_equal(again.yaw, it.yaw), "deterministic")
+        self.assertEqual(len(veg.vineyard_items(feats, chm, np.ones_like(clear), None)), 0, "roads / buildings: none")
+
+    def test_only_vineyards(self):
+        frame, feats, ring, chm, clear = self._field([0, 100, 100, 0, 0], [0, 0, 50, 50, 0], cls="orchard")
+        self.assertEqual(len(veg.vineyard_items(feats, chm, clear, None)), 0)
+
+
+class BaleTest(unittest.TestCase):
+    def _fields(self, lat, cls, n=40, size=(400.0, 300.0)):
+        """n fields side by side (one polygon each), size m."""
+        import mapgeom
+        frame = geodesy.EnuFrame(lat, 1.6)
+        geoms = []
+        for k in range(n):
+            e = np.array([0, size[0], size[0], 0, 0.0]) + k * (size[0] + 20)
+            nn = np.array([0, 0, size[1], size[1], 0.0])
+            la, lo, _ = frame.enu_to_geodetic(e, nn, np.zeros(5))
+            geoms.append((mapgeom.POLYGON, [[np.stack([lo, la], 1)]]))
+        feats = mapgeom.build("land_use", np.array([f"f{lat}-{k}" for k in range(n)]), geoms)
+        feats.attrs["class"] = np.array([cls] * n, object)
+        return feats, frame
+
+    def test_bales_on_a_share_of_the_fields(self):
+        feats, frame = self._fields(48.3, "farmland")
+        it = veg.bale_items(feats, None, None, None)
+        self.assertTrue(np.all(it.group == veg.G_STRAW_N))
+        e, n, _ = frame.geodetic_to_enu(it.lat, it.lon, np.zeros(len(it)))
+        fields = set((np.asarray(e) // 420).astype(int))
+        self.assertTrue(2 <= len(fields) <= 16, f"a share of the 40 fields: {len(fields)}")
+        per = len(it) / max(len(fields), 1) / 12.0
+        self.assertTrue(4 <= per <= 20, f"bales a hectare: {per:.1f}")
+        x = np.asarray(e) % 420
+        self.assertTrue(np.all((x > veg.BALE_EDGE_M - 0.5) & (x < 400 - veg.BALE_EDGE_M + 0.5)), "the headland clear")
+        again = veg.bale_items(feats, None, None, None)
+        self.assertTrue(np.array_equal(again.lon, it.lon), "deterministic")
+
+    def test_by_class_hemisphere_and_size(self):
+        self.assertTrue(np.all(veg.bale_items(self._fields(-35.0, "meadow")[0], None, None, None).group
+                               == veg.G_SILAGE_S))
+        self.assertEqual(len(veg.bale_items(self._fields(10.0, "farmland")[0], None, None, None)), 0, "not in the tropics")
+        self.assertEqual(len(veg.bale_items(self._fields(48.3, "vineyard")[0], None, None, None)), 0)
+        big = self._fields(48.3, "farmland", n=40, size=(2000.0, 1200.0))[0]
+        self.assertEqual(len(veg.bale_items(big, None, None, None)), 0, "a polygon of many fields: none")
+
+
+class FarmFoliageTest(unittest.TestCase):
+    def test_shrubs_line_the_gaps_between_rows(self):
+        import mapgeom
+        frame = geodesy.EnuFrame(40.0, -76.0)
+        e = np.array([-45.0, 45.0, 45.0, -45.0, -45.0])
+        n = np.array([-22.0, -22.0, 22.0, 22.0, -22.0])
+        la, lo, _ = frame.enu_to_geodetic(e, n, np.zeros(5))
+        ring = np.stack([lo, la], 1)
+        feats = mapgeom.build("land_use", np.array(["field-1"]), [(mapgeom.POLYGON, [[ring]])])
+        feats.attrs["class"] = np.array(["farmland"], object)
+        x, y = veg._to3857(ring[:, 0], ring[:, 1])
+        pad, dx = 30.0, 2.0
+        x0, x1 = float(x.min()) - pad, float(x.max()) + pad
+        y0, y1 = float(y.min()) - pad, float(y.max()) + pad
+        cols = int(np.ceil((x1 - x0) / dx))
+        rows = int(np.ceil((y1 - y0) / dx))
+        chm = Raster(np.zeros((rows, cols), np.uint8), x0, y1, dx)
+        items = veg.farm_foliage(feats, chm, np.zeros((rows, cols), bool), None)
+        self.assertGreaterEqual(len(items), 40)
+        self.assertLessEqual(len(items), 280)
+        self.assertTrue(np.all(items.kind == veg.KIND_BUSH))
+        _, nn, _ = frame.geodetic_to_enu(items.lat, items.lon, np.zeros(len(items)))
+        order = np.sort(np.asarray(nn))
+        nlines = 1 + int(np.sum(np.diff(order) > 2.0))
+        self.assertGreaterEqual(nlines, 8)
+        self.assertLessEqual(nlines, 14)
+        blocked = np.ones((rows, cols), bool)
+        self.assertEqual(len(veg.farm_foliage(feats, chm, blocked, None)), 0)

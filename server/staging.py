@@ -1,0 +1,296 @@
+"""Temporary files of the atomic writes into the game's user folder, kept outside it.
+
+The game watches its user folder: every file created or changed there is an onFileChanged event, handled in Lua by
+every loaded extension, and the engine's FileWatchers took up to ~1 s in a frame during a 100 mph drive (2026-10-17).
+A write as "<path>.tmp" then os.replace() made two events per tile file (3,220 in a 3 km drive, 1,079 of them .tmp).
+tmp_for(path) puts the temporary file in "beamngEarth_staging" next to the user folder (the same disk: the rename stays
+atomic), so only the finished file shows up. Paths outside a user folder's "temp" (the download cache) keep
+"<path>.tmp". Pure but for creating that folder.
+
+replace() is the atomic rename into the game's folder; a destination folder that vanished mid-session is made again
+(GitHub #27: a player's session folder under temp/beamngEarth was gone, and every terrain write after it failed).
+"""
+import itertools
+import logging
+import os
+import threading
+import time
+
+STAGING = "beamngEarth_staging"
+_made = set()
+_lock = threading.Lock()
+_serial = itertools.count()
+_remade = set()
+log = logging.getLogger("earthd.staging")
+
+
+SWEEP_AGE_S = 3600
+
+
+def _sweep(d):
+    """Temporary files left by a process that ended mid-write (older than SWEEP_AGE_S), once per process."""
+    import time
+    now = time.time()
+    for name in os.listdir(d):
+        p = os.path.join(d, name)
+        try:
+            if name.endswith(".tmp") and now - os.path.getmtime(p) > SWEEP_AGE_S:
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def staging_dir(path):
+    """The staging folder for a file in a user folder's temp tree, or None."""
+    p = os.path.abspath(path)
+    sep = os.sep
+    i = p.rfind(f"{sep}temp{sep}")
+    if i <= 0:
+        return None
+    user = p[:i]                                        # .../BeamNG.drive/current
+    return os.path.join(os.path.dirname(user), STAGING)
+
+
+def tmp_for(path):
+    """A temporary path to write path's content to before os.replace(tmp, path)."""
+    d = staging_dir(path)
+    if d is not None:
+        with _lock:
+            known = d in _made
+        if not known:
+            try:
+                os.makedirs(d, exist_ok=True)
+                _sweep(d)
+                with _lock:
+                    _made.add(d)
+            except OSError:
+                d = None
+    if d is None:
+        return path + ".tmp"
+    return os.path.join(d, f"{os.getpid()}_{threading.get_ident()}_{next(_serial)}_{os.path.basename(path)}.tmp")
+
+
+WARM_READ = os.environ.get("BNGE_WARM_READ", "1" if os.name == "nt" else "0") != "0"   # (=1 elsewhere: tests)
+WARM_CHUNK = 1 << 20
+
+
+def warm(path):
+    """Read a file just written into the game's folder once, here (Windows): the first open of a new file is scanned
+    by the antivirus, and the game paid it in the frame (a far tile's shape and texture 20-184 ms per tile on a
+    Windows test PC, 2026-10-24, 0.4 ms on Linux; a second open of the same file 0.15 ms). Read in this process, a
+    server worker, the scan is done before the game opens it. Errors ignored (the game reads it anyway)."""
+    try:
+        with open(path, "rb") as f:
+            while f.read(WARM_CHUNK):
+                pass
+    except OSError:
+        pass
+
+
+GAME_WAITS = (0.02, 0.05, 0.1, 0.25, 0.5, 1.0)  # s between the tries of replace into the game's folder (~1.9 s in all)
+
+
+def replace(tmp, path):
+    """os.replace(tmp, path), making path's folder again if it was deleted under us (the game or the player
+    clearing its temp folder) instead of failing every write after it. On Windows a file going into the game's folder
+    is read once at once (warm), and one held there for a moment (the game reading the copy it has, a virus scanner:
+    PermissionError, WinError 5) is tried again GAME_WAITS: a block's surface mask replaced over the one the game was
+    showing failed the whole block (a provisional block and a graded one, Windows 11, 2026-11-13). The last try's
+    PermissionError goes to the caller."""
+    if staging_dir(path) is None or _on_event_loop():
+        return _replace_once(tmp, path)     # (on the server's event loop, e.g. Server.reslot: one try, never a sleep)
+    for n, wait in enumerate(GAME_WAITS + (None,)):
+        try:
+            _replace_once(tmp, path)
+            if n:
+                log.info("%s was held (Windows: the game or a virus scanner): replaced at try %d",
+                         os.path.basename(path), n + 1)
+            return
+        except PermissionError:
+            if wait is None:
+                raise
+            time.sleep(wait)
+
+
+def _on_event_loop():
+    """True in a thread running an asyncio loop (the server's main loop: a sleep there stalls every client)."""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _replace_once(tmp, path):
+    _replace(tmp, path)
+    if WARM_READ and staging_dir(path) is not None:
+        warm(path)
+
+
+def _replace(tmp, path):
+    try:
+        os.replace(tmp, path)
+    except FileNotFoundError:
+        if not os.path.exists(tmp):
+            raise
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        with _lock:
+            first = d not in _remade
+            _remade.add(d)
+        if first:
+            log.warning("folder %s was deleted while in use (cleared temp folder?): made again", d)
+        os.replace(tmp, path)
+
+
+REPLACE_WAITS = (0.02, 0.05, 0.1, 0.25, 0.5)    # s between the tries of replace_cached (~0.9 s in all)
+READ_WAITS = (0.02, 0.05, 0.1, 0.25)            # s between the tries of read_held
+
+
+def read_held(read):
+    """read() of a cache file, tried again READ_WAITS when it raises PermissionError: on Windows a file another thread
+    or process is replacing cannot be opened for a moment (a map data water layer was "unreadable" and rebuilt from
+    the network, GitHub #240 / #241). The last try's PermissionError goes to the caller."""
+    for wait in READ_WAITS:
+        try:
+            return read()
+        except PermissionError:
+            time.sleep(wait)
+    return read()
+
+
+DAMAGED_NPZ = (OSError, ValueError, EOFError, KeyError)     # (and zipfile.BadZipFile: read_npz)
+
+
+def read_npz(path, read, what="cache file"):
+    """read(f) of the npz cache file at path (f: np.load's NpzFile), or None when the file is damaged: empty
+    (EOFError), cut short (zipfile.BadZipFile), zeroed (ValueError) or missing a member (KeyError), as a crash or power
+    loss after its write leaves it. The damaged file is removed so the caller builds it again: unread, it failed every
+    ask for good (telemetry 2026-11-08: the far tiles' EOFError, 313k times in a week from three dev builds, BadZipFile
+    beside it). Opened with its own handle, closed whatever np.load raises (numpy left a damaged file's open, and
+    Windows cannot remove an open file)."""
+    import zipfile
+    import numpy as np
+    try:
+        with open(path, "rb") as fh, np.load(fh, allow_pickle=False) as f:
+            return read(f)
+    except FileNotFoundError:
+        return None
+    except PermissionError as e:        # (Windows: held by another process, a virus scanner: whole, so kept; built anew)
+        log.debug("%s %s: %s", what, path, e)
+        return None
+    except DAMAGED_NPZ + (zipfile.BadZipFile,) as e:
+        log.warning("%s %s damaged (%s: %s): built again", what, path, type(e).__name__, e)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+
+
+def replace_cached(tmp, path):
+    """replace(tmp, path) for a cache file whose content is the same whoever writes it (a download, a decoded or built
+    copy of one). On Windows a file another thread or process has open, or memory-mapped, cannot be replaced
+    (PermissionError, WinError 5: GitHub #67, the DEM tile cache on a cloud PC failed terrain requests): retried
+    REPLACE_WAITS; still held but there, that copy is kept and tmp removed. True when tmp went in, False when the
+    copy already there was kept."""
+    for wait in REPLACE_WAITS + (None,):
+        try:
+            _replace_once(tmp, path)        # (its own tries: not replace's too)
+            return True
+        except PermissionError:
+            if wait is None:
+                if not os.path.exists(path):
+                    raise
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                return False
+            time.sleep(wait)
+
+
+INLINE_MAX = 1 << 20        # bytes: a session file this small or smaller goes inside its message (inline_json)
+
+
+def inline_raw(out_dir, vfs_path, max_bytes=INLINE_MAX, digest=False):
+    """A worker thread's inline_json: the session file's text as protocol.RawJson (spliced into its message as it is;
+    a file with \\u escapes parsed and written again as real UTF-8, as inline_json's message would carry it), or None
+    as inline_json. digest: (raw, its bytes' SHA-1) instead (the trackers' same-file check)."""
+    import hashlib
+    import json
+    import protocol
+    raw = h = None
+    try:
+        path = os.path.join(out_dir, os.path.basename(vfs_path))
+        with open(path, "rb") as f:
+            data = f.read(max_bytes + 1) if not digest else f.read()
+        if digest:
+            h = hashlib.sha1(data).digest()
+        if len(data) <= max_bytes:
+            text = data.decode("utf-8").strip()
+            if b"\\u" in data:
+                text = json.dumps(json.loads(text), separators=(",", ":"), ensure_ascii=False)
+            if text[:1] in ("{", "[") and text[-1:] in ("}", "]"):
+                raw = protocol.RawJson(text)
+    except (OSError, ValueError):
+        pass
+    return (raw, h) if digest else raw
+
+
+class Inlined:
+    """A tracker build's result with its files' inline data read in the worker (build_inline): the event loop sends
+    it without opening or parsing a file. files: {vfs path: RawJson or None}; data: the first file's."""
+    __slots__ = ("res", "data", "digest", "files")
+
+    def __init__(self, res, data, digest=None, files=None):
+        self.res, self.data, self.digest, self.files = res, data, digest, files or {}
+
+
+def build_inline(build, out_dir, digest, *args):
+    """Worker thread: build(*args), and when it made a file (its result's first item, a vfs path) the file's inline
+    data (inline_raw; with its SHA-1 when digest). Returns an Inlined."""
+    res = build(*args)
+    if res is None or not out_dir:
+        return Inlined(res, None)
+    if digest:
+        raw, h = inline_raw(out_dir, res[0], digest=True)
+        return Inlined(res, raw, h, {res[0]: raw})
+    raw = inline_raw(out_dir, res[0])
+    return Inlined(res, raw, None, {res[0]: raw})
+
+
+def build_inline_paths(build, out_dir, paths_of, *args):
+    """Worker thread: build(*args) and the inline data of each file paths_of(result) names (a list of vfs paths).
+    Returns an Inlined."""
+    res = build(*args)
+    files = {}
+    if res is not None and out_dir:
+        for p in paths_of(res):
+            if p and p not in files:
+                files[p] = inline_raw(out_dir, p)
+    return Inlined(res, None, None, files)
+
+
+def inline_from(pre, out_dir, vfs_path):
+    """The inline data of a session file: read in the worker (pre: an Inlined naming it), else inline_json here."""
+    if pre is not None and vfs_path in pre.files:
+        return pre.files[vfs_path]
+    return inline_json(out_dir, vfs_path) if out_dir else None
+
+
+def inline_json(out_dir, vfs_path, max_bytes=INLINE_MAX):
+    """The parsed JSON of a session file (vfs_path's name in out_dir), to send inside its message (its "data") so the
+    game does not open the file: on Windows the game's first read of a file the server just wrote took 6.8 ms on
+    average and up to 552 ms, in the frame (a 4-minute highway drive on a Windows test PC, 2026-10-24: 1,176 tile files
+    read; 0.03 ms on Linux). None when it cannot be read or is larger than max_bytes (the mod reads the file then)."""
+    import json
+    try:
+        path = os.path.join(out_dir, os.path.basename(vfs_path))
+        if os.path.getsize(path) > max_bytes:
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None

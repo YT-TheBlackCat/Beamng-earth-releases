@@ -1,0 +1,1184 @@
+"""Railway tracks (railways.py): the rail lines taken, the level crossings, the bed's heights and the mesh."""
+import math
+import os
+import sys
+import tempfile
+import types
+import unittest
+import unittest.mock
+from unittest import mock
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import railways  # noqa: E402
+import roads  # noqa: E402
+from test_roads import FRAME, features  # noqa: E402
+
+
+def flat(xy):
+    return np.full(len(xy), 10.0)
+
+
+class RailwayTest(unittest.TestCase):
+    def test_distant_bridge_of_a_nearby_feature_is_not_profiled(self):
+        # One feature crosses the tile, but its last 100 m is a bridge 5 km away.
+        f = features([[(-100.0, 100.0), (5000.0, 100.0), (5100.0, 100.0)]],
+                     ["standard_gauge"], subtypes=["rail"],
+                     flags=[(0, "is_bridge", 5100.0 / 5200.0, 1.0)])
+        calls = []
+
+        def ground(xy):
+            calls.append(len(xy))
+            self.assertLess(float(xy[:, 0].max()), 1000.0,
+                            "a distant bridge must not trigger elevation work")
+            return flat(xy)
+
+        self.assertIsNotNone(railways.tile_mesh(FRAME, 0, 0, [f], ground))
+        self.assertTrue(calls, "the nearby ground track is still built")
+
+    def test_bridge_bbox_overlap_without_track_nearby_needs_no_work(self):
+        # The bbox covers the tile, but all three sides of this U are far away.
+        f = features([[(-1000.0, -1000.0), (-1000.0, 1000.0),
+                       (1000.0, 1000.0), (1000.0, -1000.0)]],
+                     ["standard_gauge"], subtypes=["rail"], flags=[(0, "is_bridge")])
+        ground = mock.Mock(side_effect=AssertionError("no railway here to sample"))
+        with mock.patch.object(railways, "_resample", wraps=railways._resample) as resample:
+            self.assertIsNone(railways.tile_mesh(FRAME, 0, 0, [f], ground))
+        ground.assert_not_called()
+        resample.assert_not_called()
+
+    def test_crossing_bridge_keeps_both_ends_outside_search_window(self):
+        f = features([[(-500.0, 100.0), (800.0, 100.0)]],
+                     ["standard_gauge"], subtypes=["rail"], flags=[(0, "is_bridge")])
+        parts = railways.parts(FRAME, [f], roads.tile_bbox(0, 0), clip=True)
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0][2], "bridge")
+        np.testing.assert_allclose(parts[0][3][[0, -1]], f.xy_in(FRAME)[[0, -1]], atol=1e-6, rtol=0)
+        self.assertIsNotNone(railways.tile_mesh(FRAME, 0, 0, [f], flat))
+
+    def test_bridge_in_context_outside_drawn_tile_is_kept(self):
+        f = features([[(300.0, 100.0), (420.0, 100.0)]],
+                     ["standard_gauge"], subtypes=["rail"], flags=[(0, "is_bridge")])
+        parts = railways.parts(FRAME, [f], roads.tile_bbox(0, 0), clip=True)
+        self.assertEqual(len(parts), 1, "the existing reach supplies bridge and approach context")
+        np.testing.assert_allclose(parts[0][3][[0, -1]], f.xy_in(FRAME)[[0, -1]], atol=1e-6, rtol=0)
+
+    def test_bridge_profile_agrees_across_adjacent_tiles(self):
+        f = features([[(-400.0, 100.0), (100.0, 100.0)],
+                      [(100.0, 100.0), (450.0, 100.0)],
+                      [(450.0, 100.0), (900.0, 100.0)]],
+                     ["standard_gauge"] * 3, subtypes=["rail"] * 3, flags=[(1, "is_bridge")])
+        profiles = []
+        for tx in (0, 1):
+            parts = railways.parts(FRAME, [f], roads.tile_bbox(tx, 0), clip=True)
+            bridge = next(i for i, part in enumerate(parts) if part[2] == "bridge")
+            bed, _ = railways.profile(parts, flat)[bridge]
+            profiles.append((parts[bridge][3], bed))
+        np.testing.assert_allclose(profiles[0][0], profiles[1][0], atol=1e-6, rtol=0)
+        np.testing.assert_allclose(profiles[0][1], profiles[1][1], atol=1e-6, rtol=0)
+
+    def test_empty_tile_does_not_sample_ground(self):
+        ground = mock.Mock(side_effect=AssertionError("empty tile"))
+        self.assertIsNone(railways.tile_mesh(FRAME, 0, 0, [], ground))
+        ground.assert_not_called()
+
+    def test_track_mesh_along_a_line(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)]], ["standard_gauge"], subtypes=["rail"])
+        mesh = railways.tile_mesh(FRAME, 0, 0, [f], flat, "fi")
+        self.assertIsNotNone(mesh)
+        P, T, UV, mats, M = mesh
+        self.assertEqual(mats, [railways.BALLAST, railways.CONCRETE, railways.STEEL, railways.SLEEPER, railways.COLLIDER])
+        self.assertLess(len(P), railways.VERTS_MAX)
+        self.assertEqual(int(T.max()) + 1, len(P))
+        steel = P[np.unique(T[M == 2])]
+        self.assertAlmostEqual(float(steel[:, 2].max()),
+                               10.0 + railways.BALLAST_H - railways.SLEEPER_SINK + railways.SLEEPER_H + railways.RAIL_H, 3)
+        heads = np.unique(np.round(steel[:, 1] + 0.0, 2))      # (the tile's origin at y 0)
+        gap = heads.max() - heads.min() - 2 * railways.RAIL_HEAD    # between the rails' inner faces
+        self.assertAlmostEqual(gap, railways.FI_GAUGE_M, delta=0.011, msg="Finnish broad gauge")
+        n_sleepers = (M == mats.index(railways.SLEEPER)).sum() // 10
+        self.assertGreater(n_sleepers, 256 / railways.SLEEPER_EVERY * 0.95)
+        self.assertGreaterEqual(P[:, 0].min(), -roads.OVERLAP - railways.STEP_M - 3.0)
+
+    def test_lean_collider_without_the_sleepers(self):
+        # (PR #41) the collider is the bed alone; BNE_RAIL_COLLIDE=on adds the rails' own boxes (plan 035)
+        f = features([[(-50.0, 100.0), (300.0, 100.0)]], ["standard_gauge"], subtypes=["rail"])
+        mesh = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        P, T, UV, mats, M = mesh
+        ball, coll = mats.index(railways.BALLAST), mats.index(railways.COLLIDER)
+        self.assertFalse(railways.RAIL_COLLIDE, "the rails collide only with BNE_RAIL_COLLIDE=on (2.7x the collider)")
+        with unittest.mock.patch.object(railways, "RAIL_COLLIDE", True):
+            cP, cT, cUV, cmats, cM = railways.collision_mesh(mesh)
+            sleepers_left = railways.collision_mesh((P, T[M == mats.index(railways.SLEEPER)], UV, mats,
+                                                     M[M == mats.index(railways.SLEEPER)]))
+        # BNE_RAIL_COLLIDE=on: the bed and the rails' boxes (GitHub #821, #845), not the drawn rails and the sleepers
+        self.assertEqual({mats[k] for k in np.unique(cM)}, {railways.BALLAST, railways.COLLIDER})
+        np.testing.assert_array_equal(cT, T[np.isin(M, [ball, coll])])
+        self.assertIs(cP, P)
+        self.assertIsNone(railways.collision_mesh(None))
+        self.assertIsNone(sleepers_left, "nothing left: no collider")
+        with unittest.mock.patch.object(railways, "RAIL_COLLIDE", False):     # the default: PR #41's
+            lean = railways.collision_mesh(mesh)
+            np.testing.assert_array_equal(lean[1], T[M == ball])
+            self.assertIsNone(railways.collision_mesh((P, T[M == 2], UV, mats, M[M == 2])))
+        # the drawn mesh has no boxes
+        drawn = railways.render_mesh(mesh)
+        self.assertEqual(len(drawn[1]), int((M != coll).sum()))
+        self.assertNotIn(coll, set(np.asarray(drawn[4]).tolist()))
+        self.assertIs(railways.render_mesh(None), None)
+        with tempfile.TemporaryDirectory() as tmp:      # written by the road tile beside the drawn track
+            path, _n = roads.write_tile(tmp, "/v", 1, 0, 0, [], rail_mesh=mesh)
+            import json
+            with open(os.path.join(tmp, os.path.basename(path))) as fh:
+                data = json.load(fh)
+            self.assertEqual(data["railcol"]["shape"], "/v/railcol_1_0_0.cdae")
+            self.assertTrue(os.path.getsize(os.path.join(tmp, "railcol_1_0_0.cdae"))
+                            < 0.5 * os.path.getsize(os.path.join(tmp, "rail_1_0_0.cdae")))
+        self.assertEqual(roads.shape_files(1, 0, 0)["railcol"], "railcol_1_0_0.cdae")
+
+    def test_rail_collider_boxes_hold_the_gauge_and_are_thick(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)]], ["standard_gauge"], subtypes=["rail"])
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        v = P[np.unique(T[M == mats.index(railways.COLLIDER)])]
+        y = np.sort(v[:, 1])
+        cl = [y[0]]
+        for q in y[1:]:
+            if q - cl[-1] > 0.05:
+                cl.append(q)
+        self.assertEqual(len(cl), 4, "an outer and an inner face a side")
+        self.assertAlmostEqual(cl[2] - cl[1], railways.GAUGE_M, delta=0.01, msg="the inner faces are the gauge apart")
+        self.assertAlmostEqual(cl[1] - cl[0], railways.COLLIDER_W, delta=0.01)
+        self.assertAlmostEqual(cl[3] - cl[2], railways.COLLIDER_W, delta=0.01)
+        self.assertGreaterEqual(float(v[:, 2].max() - v[:, 2].min()), 0.30, "at least 30 cm tall")
+
+    def test_collider_runs_through_a_level_crossing_and_stops_in_a_switch(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)], [(120.0, 0.0), (120.0, 250.0)]],
+                     ["standard_gauge", "secondary"], subtypes=["rail", "road"])
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        c = P[np.unique(T[M == mats.index(railways.COLLIDER)])]
+        self.assertTrue(((c[:, 0] > 112) & (c[:, 0] < 128)).any(), "boxes across the road: the flange has its inner face")
+        self.assertGreater(float(c[:, 0].max() - c[:, 0].min()), 250.0, "the boxes run the tile's length")
+        # a side track leaving the main one at 20 degrees: the boxes of both stop where they meet
+        g = features([[(-50.0, 100.0), (300.0, 100.0)], [(100.0, 100.0), (300.0, 190.0)]],
+                     ["standard_gauge", "standard_gauge"], subtypes=["rail", "rail"])
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [g], flat)
+        c = P[np.unique(T[M == mats.index(railways.COLLIDER)])]
+        near = (c[:, 0] > 101) & (c[:, 0] < 105) & (np.abs(c[:, 1] - 100.0) < 3.0)
+        self.assertFalse(near.any(), "no box in the switch")
+        self.assertTrue(((c[:, 0] > 200) & (np.abs(c[:, 1] - 100.0) < 2.0)).any(), "the through track goes on")
+
+    def test_a_rail_tunnel_is_a_tube_over_a_flat_bed_with_portals(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)]], ["standard_gauge"], subtypes=["rail"],
+                     flags=[(0, "is_tunnel", 0.3, 0.7)])
+        hill = lambda xy: 10.0 + 12.0 * np.exp(-((xy[:, 0] - 125.0) / 60.0) ** 2)      # a hill over the tunnel
+        with unittest.mock.patch.object(railways, "TUNNELS_ON", False):
+            off = railways.tile_mesh(FRAME, 0, 0, [f], hill)
+        with unittest.mock.patch.object(railways, "TUNNELS_ON", True):
+            on = railways.tile_mesh(FRAME, 0, 0, [f], hill)
+        self.assertIsNotNone(on)
+        P, T, UV, mats, M = on
+        conc = P[np.unique(T[M == mats.index(railways.CONCRETE)])]
+        self.assertGreater(len(conc), 100, "a tube of concrete")
+        inside = conc[(conc[:, 0] > 60) & (conc[:, 0] < 190)]
+        self.assertGreater(float(inside[:, 2].max() - inside[:, 2].min()), 5.5, "6 m tall over the floor")
+        self.assertLess(float(np.abs(inside[:, 1] - np.median(inside[:, 1])).max()), 6.0)
+        steel = P[np.unique(T[M == mats.index(railways.STEEL)])]
+        under = steel[(steel[:, 0] > 80) & (steel[:, 0] < 170)]
+        self.assertTrue(len(under), "rails inside the tunnel")
+        self.assertLess(float(under[:, 2].max()), 10.0 + 12.0 * 0.4, "the bed runs straight between the portals, not over the hill")
+        self.assertTrue((M == mats.index(railways.CONCRETE)).sum() > ((np.asarray(off[4]) == off[3].index(railways.CONCRETE)).sum() if off else 0))
+
+    def test_rail_tunnel_holes_cut_the_hillside_at_the_portals(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)]], ["standard_gauge"], subtypes=["rail"],
+                     flags=[(0, "is_tunnel", 0.3, 0.7)])
+        elev = lambda la, lo: 10.0 + 12.0 * np.exp(-(((np.asarray(lo) - FRAME.lon0) * 111320.0 * math.cos(math.radians(FRAME.lat0)) - 125.0) / 60.0) ** 2)
+        box = roads.tile_bbox(0, 0)
+        with unittest.mock.patch.object(railways, "TUNNELS_ON", False):
+            self.assertEqual(railways.tunnel_hole_parts(FRAME, lambda k: f, elev, box), [])
+        with unittest.mock.patch.object(railways, "TUNNELS_ON", True),                 unittest.mock.patch.object(railways, "cells_near", lambda *a, **k: [0]):
+            got = railways.tunnel_hole_parts(FRAME, lambda k: f, elev, box)
+        self.assertEqual(len(got), 1)
+        fid, xy, z = got[0]
+        self.assertAlmostEqual(float(z[0] - z[-1]), 0.0, delta=0.5, msg="a level floor between level portals")
+        n, sq = 256, 1.0
+        u = np.full((n, n), 10.0)
+        iy, ix = np.mgrid[0:n, 0:n]
+        x, y = ix * sq - n * sq / 2 + 128.0, iy * sq - n * sq / 2 + 128.0
+        u = 10.0 + 12.0 * np.exp(-((x - 125.0) / 60.0) ** 2)
+        mask = railways.tunnel_hole_mask(got, u, 128.0, 128.0, sq)
+        self.assertEqual(mask.shape, u.shape)
+        self.assertTrue(mask.any(), "a hole at a portal")
+        self.assertFalse(mask[:, :20].any(), "none on open ground")
+
+    def test_a_road_that_only_ends_at_the_track_does_not_cut_it(self):
+        track = [(-50.0, 100.0), (300.0, 100.0)]
+        hw = 1.75
+        t_end = features([track, [(120.0, 20.0), (120.0, 99.0)]], ["standard_gauge", "service"], subtypes=["rail", "road"])
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [t_end], flat)
+        ball = P[np.unique(T[np.asarray(M) == mats.index(railways.BALLAST)])]
+        self.assertTrue(((ball[:, 0] > 120 - hw) & (ball[:, 0] < 120 + hw)).any(), "the ballast runs on past a road's end")
+        cross = features([track, [(120.0, 20.0), (120.0, 180.0)]], ["standard_gauge", "service"], subtypes=["rail", "road"])
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [cross], flat)
+        ball = P[np.unique(T[np.asarray(M) == mats.index(railways.BALLAST)])]
+        self.assertFalse(((ball[:, 0] > 120 - hw) & (ball[:, 0] < 120 + hw)).any(), "a road across does cut it")
+
+    def test_a_dead_end_gets_a_buffer_stop_a_joint_does_not(self):
+        f = features([[(40.0, 100.0), (200.0, 100.0)]], ["standard_gauge"], subtypes=["rail"])
+        rows = []
+        railways.tile_mesh(FRAME, 0, 0, [f], flat, furniture=rows)
+        buf = [r for r in rows if r[0] == "rrbuffer"]
+        self.assertEqual(len(buf), 2, "one at each end")
+        top = 10.0 + railways.RAIL_TOP_M
+        for r in buf:
+            self.assertAlmostEqual(r[3], top, delta=0.02, msg="at the rail heads' height")
+            self.assertEqual(r[6], railways.BUFFER_HEIGHT)
+        # the model's +Y runs into the stop: for the east end, the train comes from the west: +Y is +X, so +X is the right (south)
+        east = max(buf, key=lambda r: r[1])
+        self.assertAlmostEqual(east[1], 200.0 - railways.BUFFER_BACK_M, delta=0.6)
+        self.assertAlmostEqual(east[4], 270.0, delta=0.5)
+        joined = features([[(40.0, 100.0), (120.0, 100.0)], [(120.0, 100.0), (200.0, 100.0)]], ["standard_gauge"] * 2,
+                          subtypes=["rail"] * 2)
+        rows = []
+        railways.tile_mesh(FRAME, 0, 0, [joined], flat, furniture=rows)
+        self.assertTrue(all(abs(r[1] - 120.0) > 10 for r in rows if r[0] == "rrbuffer"), "none at a joint")
+        with unittest.mock.patch.object(railways, "STATION_FURNITURE_ON", False):
+            rows = []
+            railways.tile_mesh(FRAME, 0, 0, [f], flat, furniture=rows)
+        self.assertEqual(rows, [], "BNE_RAIL_FURNITURE=off")
+
+    def test_a_footway_across_the_track_gets_panels_flush_with_the_rails(self):
+        track = [(-50.0, 100.0), (300.0, 100.0)]
+        f = features([track, [(120.0, 60.0), (120.0, 140.0)], [(60.0, 90.0), (200.0, 90.5)]],
+                     ["standard_gauge", "footway", "footway"], subtypes=["rail", "road", "road"])
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        conc = P[np.unique(T[np.asarray(M) == mats.index(railways.CONCRETE)])]
+        top = 10.0 + railways.RAIL_TOP_M - 0.012
+        panel = conc[(np.abs(conc[:, 0] - 120.0) < 2.5) & (np.abs(conc[:, 2] - top) < 0.003)]
+        self.assertGreater(len(panel), 8, "panels at the footway's crossing")
+        wide = float(panel[:, 1].max() - panel[:, 1].min())
+        self.assertAlmostEqual(wide, railways.GAUGE_M + 2 * (railways.RAIL_HEAD + 2 * railways.WALK_PANEL_OUT_M), delta=0.05)
+        far = conc[(np.abs(conc[:, 0] - 180.0) < 20.0) & (np.abs(conc[:, 2] - top) < 0.003)]
+        self.assertEqual(len(far), 0, "a footway running beside the track makes none")
+        rows = []
+        railways.tile_mesh(FRAME, 0, 0, [f], flat, furniture=rows)
+        signs = sorted((r for r in rows if r[0] == "rrwalk"), key=lambda r: r[2])
+        self.assertEqual(len(signs), 2, "a warning sign at each side of the track")
+        self.assertLess(signs[0][2], 100.0 - 2.0)
+        self.assertGreater(signs[1][2], 100.0 + 2.0)
+        self.assertEqual(signs[0][6], railways.WALK_SIGN_HEIGHT)
+
+    def test_walk_signs_stand_on_the_ballast_not_under_an_embankment(self):
+        track = [(-50.0, 100.0), (300.0, 100.0)]
+        f = features([track, [(120.0, 60.0), (120.0, 140.0)]], ["standard_gauge", "footway"], subtypes=["rail", "road"])
+        low = lambda xy: np.where(np.abs(xy[:, 1] - 100.0) < 2.0, 10.0, 5.0)     # the land 5 m under the track's bed
+        rows = []
+        railways.tile_mesh(FRAME, 0, 0, [f], low, furniture=rows)
+        signs = [r for r in rows if r[0] == "rrwalk"]
+        self.assertEqual(len(signs), 2)
+        for r in signs:
+            self.assertGreater(r[3], 10.0 + railways.BALLAST_H - 1.5, "on the ballast's slope, not on the land 5 m under it")
+
+    def test_a_pedestrian_way_with_a_level_crossing_node_gets_the_crossing_devices(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)], [(120.0, 40.0), (120.0, 160.0)]],
+                     ["standard_gauge", "pedestrian"], subtypes=["rail", "road"])
+        lon, lat = FRAME.lon0 + 120.0 / (111320.0 * math.cos(math.radians(FRAME.lat0))), FRAME.lat0 + 100.0 / 111320.0
+        f.__dict__["_rail_nodes"] = [(lon, lat, {"railway": "level_crossing", "crossing:barrier": "full"})]
+        rows = railways.crossing_props(FRAME, 0, 0, [f], flat, False, None, "CZ")
+        self.assertEqual(len(rows), 2, "a kit at each approach")
+        self.assertTrue(all(r[0].startswith("rrgate") for r in rows), "gates, from the node's barrier tag")
+        self.assertTrue(all(abs(r[1] - 120.0) < 8.0 for r in rows))
+        self.assertTrue(rows[0][2] < 100.0 < rows[1][2] or rows[1][2] < 100.0 < rows[0][2], "one each side of the track")
+        f2 = features([[(-50.0, 100.0), (300.0, 100.0)], [(120.0, 40.0), (120.0, 160.0)]],
+                      ["standard_gauge", "pedestrian"], subtypes=["rail", "road"])
+        self.assertEqual(railways.crossing_props(FRAME, 0, 0, [f2], flat, False, None, "CZ"), [], "no node, no devices")
+
+    def test_a_short_rail_bridge_over_a_road_on_level_ground_is_a_level_crossing(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)], [(120.0, 20.0), (120.0, 180.0)]], ["standard_gauge", "primary"],
+                     subtypes=["rail", "road"], flags=[(0, "is_bridge", 160.0 / 350.0, 180.0 / 350.0)])
+        box = roads.tile_bbox(0, 0)
+        with unittest.mock.patch.object(railways, "RAW_ELEV", lambda la, lo: np.full(np.shape(la), 344.0)):
+            kinds = {k for _f, _c, k, _xy in railways.parts(FRAME, [f], box, clip=True)}
+            self.assertEqual(kinds, {"ground"}, "level ground: no bridge")
+            with unittest.mock.patch.object(railways, "LEVEL_BRIDGES_ON", False):
+                self.assertIn("bridge", {k for _f, _c, k, _xy in railways.parts(FRAME, [f], box, clip=True)})
+
+        def valley(la, lo):        # (the road 6 m under the track's ends: a real underpass)
+            e, _n, _ = FRAME.geodetic_to_enu(np.asarray(la), np.asarray(lo), 0.0)
+            return 344.0 - 6.0 * (np.abs(np.asarray(e) - 120.0) < 6.0)
+        with unittest.mock.patch.object(railways, "RAW_ELEV", valley):
+            self.assertIn("bridge", {k for _f, _c, k, _xy in railways.parts(FRAME, [f], box, clip=True)})
+
+        def cut(la, lo):            # (the bridge's mapped ends down the cut's sides: Nachod's road 14, 2026-11-09)
+            e, _n, _ = FRAME.geodetic_to_enu(np.asarray(la), np.asarray(lo), 0.0)
+            return 344.0 - 4.0 * (np.abs(np.asarray(e) - 120.0) < 11.0)
+        with unittest.mock.patch.object(railways, "RAW_ELEV", cut):
+            self.assertIn("bridge", {k for _f, _c, k, _xy in railways.parts(FRAME, [f], box, clip=True)})
+
+    def test_a_road_crossing_at_grade_couples_the_bed_as_the_flush_crossing(self):
+        xy = np.c_[np.arange(0.0, 101.0, 2.0), np.zeros(51)]
+        zb = np.full(51, 100.0)
+        road = (np.array([[50.0, -20.0], [50.0, 20.0]]), np.array([100.5, 100.5]), 4.0)
+        beside = (np.array([[0.0, 10.0], [100.0, 10.0]]), np.array([101.0, 101.0]), 3.0)
+        self.assertEqual(railways.seam_lowered(xy, zb, [road, beside]), (0,), "a road beside the track is as it is")
+        self.assertAlmostEqual(railways.SEAM_LOWER_M, railways.RAIL_TOP_M - railways.FLUSH_LIFT_M)
+        z = railways.flush_to_plans(xy, zb, [road])
+        self.assertAlmostEqual(float(z[25]), 100.5 + railways.FLUSH_LIFT_M - railways.RAIL_TOP_M, places=6)
+        self.assertEqual(float(z[0]), 100.0)
+
+    def test_a_footway_over_a_double_track_is_one_crossing(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)], [(-50.0, 104.5), (300.0, 104.5)], [(120.0, 60.0), (120.0, 150.0)]],
+                     ["standard_gauge", "standard_gauge", "footway"], subtypes=["rail", "rail", "road"])
+        rows = []
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], flat, furniture=rows)
+        signs = sorted((r for r in rows if r[0] == "rrwalk"), key=lambda r: r[2])
+        self.assertEqual(len(signs), 2, "one sign at each end of the double track, none between the tracks")
+        self.assertLess(signs[0][2], 100.0 - 2.5)
+        self.assertGreater(signs[1][2], 104.5 + 2.5)
+        conc = P[np.unique(T[np.asarray(M) == mats.index(railways.CONCRETE)])]
+        top = 10.0 + railways.RAIL_TOP_M - 0.012
+        gap = conc[(np.abs(conc[:, 0] - 120.0) < 2.0) & (np.abs(conc[:, 1] - 102.25) < 0.5) & (np.abs(conc[:, 2] - top) < 0.01)]
+        self.assertGreater(len(gap), 0, "a panel over the gap between the tracks")
+
+    def test_a_path_running_along_a_track_is_no_crossing(self):
+        rails = [(0, "standard_gauge", "ground", np.c_[np.arange(0.0, 200.0, 2.0), np.full(100, 100.0)])]
+        ex = (0.0, 0.0, 256.0, 256.0)
+        across = [(np.array([[101.0, 60.0], [101.0, 140.0]]), 1.5)]
+        got = railways.walk_crossings(rails, across, [], [], ex)
+        self.assertEqual(len(got), 1, "a path square to the track crosses it")
+        shallow = [(np.array([[41.0, 80.0], [161.0, 120.0]]), 1.5)]       # 18 deg to the line
+        self.assertEqual(railways.walk_crossings(rails, shallow, [], [], ex), [], "one 18 degrees to it runs along it")
+        slanted = [(np.array([[61.0, 70.0], [141.0, 130.0]]), 1.5)]        # 37 deg, but leaves it
+        self.assertEqual(len(railways.walk_crossings(rails, slanted, [], [], ex)), 1)
+        hugging = [(np.array([[41.0, 94.0], [91.0, 96.0], [111.0, 104.0], [161.0, 106.0]]), 1.5)]
+        self.assertEqual(railways.walk_crossings(rails, hugging, [], [], ex), [], "one that stays beside the track")
+        with unittest.mock.patch.object(railways, "WALK_STRICT_ON", False):
+            self.assertEqual(len(railways.walk_crossings(rails, hugging, [], [], ex)), 1, "BNE_RAIL_WALK_STRICT=off")
+
+    def test_a_crossing_node_without_a_way_still_gets_panels_and_signs(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)]], ["standard_gauge"], subtypes=["rail"])
+        lon, lat = FRAME.lon0 + 150.0 / (111320.0 * math.cos(math.radians(FRAME.lat0))), FRAME.lat0 + 100.0 / 111320.0
+        f.__dict__["_rail_nodes"] = [(lon, lat, {"railway": "crossing"}), (lon + 0.0004, lat, {"railway": "level_crossing"})]
+        rows = []
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], flat, furniture=rows)
+        conc = P[np.unique(T[np.asarray(M) == mats.index(railways.CONCRETE)])]
+        top = 10.0 + railways.RAIL_TOP_M - 0.012
+        panel = conc[(np.abs(conc[:, 0] - 150.0) < 2.0) & (np.abs(conc[:, 2] - top) < 0.003)]
+        self.assertGreater(len(panel), 8, "panels where OSM has a crossing node, on a track with no way to it")
+        self.assertEqual(len([r for r in rows if r[0] == "rrwalk"]), 2)
+        self.assertFalse(((conc[:, 0] > 150.0 + 40.0) & (np.abs(conc[:, 2] - top) < 0.003)).any(), "a level_crossing node is not one")
+
+    def test_a_tile_past_the_vertex_budget_keeps_its_main_lines(self):
+        long = [[(-50.0, 20.0 + 6.0 * k), (300.0, 20.0 + 6.0 * k)] for k in range(8)]
+        short = [[(100.0, 120.0 + 2.0 * k), (130.0, 120.0 + 2.0 * k)] for k in range(8)]
+        f = features(long + short, ["standard_gauge"] * 16, subtypes=["rail"] * 16)
+        with unittest.mock.patch.object(railways, "TILE_VERTS_MAX", 25000):
+            got = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        self.assertIsNotNone(got, "not the whole tile's track gone")
+        self.assertLessEqual(len(got[0]), 25000)
+        steel = got[0][np.unique(got[1][np.asarray(got[4]) == got[3].index(railways.STEEL)])]
+        self.assertGreater(float(steel[:, 0].max() - steel[:, 0].min()), 250.0, "the long lines stay")
+        self.assertLess(float(((steel[:, 0] > 100) & (steel[:, 0] < 130)).sum()), 8 * 4 * 60, "the shortest were left out")
+
+    def test_roads_and_trams_are_not_tracks(self):
+        f = features([[(0.0, 50.0), (200.0, 50.0)], [(0.0, 80.0), (200.0, 80.0)]], ["residential", "tram"],
+                     subtypes=["road", "rail"])
+        self.assertIsNone(railways.tile_mesh(FRAME, 0, 0, [f], flat))
+
+    def test_level_crossing_cuts_the_track(self):
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(120.0, 0.0), (120.0, 250.0)]], ["standard_gauge", "secondary"],
+                     subtypes=["rail", "road"])
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        drawn = np.asarray(M) != mats.index(railways.COLLIDER)       # (the physics boxes run on across it: see below)
+        x = P[np.unique(T[drawn])][:, 0]
+        hw = roads.road_specs(f)[1].width / 2
+        self.assertFalse(((x > 120 - hw) & (x < 120 + hw)).any(), "nothing drawn on the road")
+
+    def test_abandoned_lines_are_drawn_but_not_graded(self):
+        """GitHub #706 / #837: an abandoned line's bed graded to a 2 % line cut walls into mountainsides. It gets no
+        grading plan (the ground stays as it is) but is still drawn, worn, on the ground; a disused one is graded."""
+        f = features([[(0.0, 60.0), (250.0, 60.0)], [(0.0, 120.0), (250.0, 120.0)], [(0.0, 180.0), (250.0, 180.0)]],
+                     ["standard_gauge"] * 3, subtypes=["rail"] * 3, flags=[(1, "is_abandoned"), (2, "is_disused")])
+
+        def hill(la, lo):           # (a mountainside across the lines: 30 %)
+            y = np.asarray(FRAME.geodetic_to_enu(la, lo, 0.0)[1], np.float64)
+            return 100.0 + 0.3 * y
+        plans = railways.grade_plans(FRAME, [f], roads.tile_bbox(0, 0), hill)
+        self.assertEqual(sorted({fid for fid, *_ in plans}), ["id000", "id002"], "the abandoned line not graded")
+        P, T, *_ = railways.tile_mesh(FRAME, 0, 0, [f], lambda xy: 100.0 + 0.3 * xy[:, 1])
+        y = P[np.unique(T)][:, 1]
+        self.assertTrue(((y > 110.0) & (y < 130.0)).any(), "its track still drawn")
+
+    def test_worn_lines_are_cut_across_a_motorway(self):
+        """GitHub #918: an abandoned or disused line mapped across a motorway on the ground (the A20, its old beds
+        under the carriageway) is cut there, so its bed no longer dips the motorway; a line in use is not; an
+        abandoned line is cut at a trunk road too, a disused one is not."""
+        f = features([[(0.0, 60.0), (250.0, 60.0)], [(0.0, 100.0), (250.0, 100.0)], [(0.0, 140.0), (250.0, 140.0)],
+                      [(0.0, 200.0), (250.0, 200.0)], [(0.0, 230.0), (250.0, 230.0)],
+                      [(120.0, 0.0), (120.0, 180.0)], [(60.0, 190.0), (60.0, 250.0)]],
+                     ["standard_gauge"] * 5 + ["motorway", "trunk"], subtypes=["rail"] * 5 + ["road"] * 2,
+                     flags=[(1, "is_disused"), (2, "is_abandoned"), (3, "is_abandoned"), (4, "is_disused")])
+        rails = railways.parts(FRAME, [f], roads.tile_bbox(0, 0))
+        hw = roads.STYLE["motorway"][0] / 2
+
+        def over(fid, x):
+            return any(((xy[:, 0] > x - hw) & (xy[:, 0] < x + hw)).any() for i, _c, k, xy in rails if i == fid)
+        self.assertTrue(over("id000", 120.0), "a line in use keeps its track (a missing bridge is another matter)")
+        self.assertFalse(over("id001", 120.0), "a disused line cut at the motorway")
+        self.assertFalse(over("id002", 120.0), "an abandoned line cut at the motorway")
+        self.assertFalse(over("id003", 60.0), "an abandoned line cut at a trunk road")
+        self.assertTrue(over("id004", 60.0), "a disused line kept at a trunk road (its level crossing)")
+        self.assertEqual(len([1 for i, *_ in rails if i == "id002"]), 2, "both sides of the motorway kept")
+        self.assertEqual(railways._cut_worn_at_motorways(rails, {}, []), rails)
+
+    def test_short_tunnel_under_a_road_is_track_and_abandoned_lines_are_worn(self):
+        """The line under a road bridge tagged is_tunnel for 12 m (OSM's habit) is track; a long tunnel is left out;
+        an abandoned line beside it is drawn worn (Joensuu, 2026-10-25; the user, 2026-10-27: abandoned lines shown,
+        grown over)."""
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(0.0, 110.0), (250.0, 110.0)], [(0.0, 150.0), (250.0, 150.0)]],
+                     ["standard_gauge", "unknown", "standard_gauge"], subtypes=["rail"] * 3,
+                     flags=[(0, "is_tunnel", 0.46, 0.51), (1, "is_abandoned"), (2, "is_tunnel", 0.2, 0.8)])
+        worn = {}
+        rails = railways.parts(FRAME, [f], roads.tile_bbox(0, 0), worn=worn)
+        got = [(fid, kind, float(np.ptp(xy[:, 0]))) for fid, _c, kind, xy in rails]
+        self.assertEqual(sorted(g[0] for g in got), ["id000", "id001", "id002", "id002"])
+        self.assertEqual(worn, {"id001": 2}, "the abandoned line worn")
+        self.assertEqual([c for fid, c, *_ in rails if fid == "id001"], ["standard_gauge"])
+        self.assertAlmostEqual([g[2] for g in got if g[0] == "id000"][0], 250.0, 0, "track through the short tunnel")
+        self.assertLess(max(g[2] for g in got if g[0] == "id002"), 60.0, "a long tunnel left out")
+
+    def test_level_crossing_rails_meet_the_road_on_gentle_ramps(self):
+        """The rails' top is flush with the road where the track crosses it (they stood 0.6 m over it at its edge), and
+        the track ramps back to its own height at 1.7 %."""
+        s = np.arange(0.0, 200.0, 2.0)
+        zb = np.full(len(s), 10.0)
+        blk = (s >= 96) & (s <= 104)
+        z = railways._flush(s, zb, blk, np.full(int(blk.sum()), 10.0))
+        top = z + railways.RAIL_TOP_M
+        np.testing.assert_allclose(top[blk], 10.0 + railways.FLUSH_LIFT_M)
+        self.assertLessEqual(float(np.abs(np.diff(z) / np.diff(s)).max()), railways.FLUSH_GRADE + 1e-9)
+        self.assertEqual(float(z[0]), 10.0, "its own height away from the road")
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [features([[(0.0, 100.0), (250.0, 100.0)],
+                                                                       [(120.0, 0.0), (120.0, 250.0)]],
+                                                                      ["standard_gauge", "secondary"],
+                                                                      subtypes=["rail", "road"])], flat)
+        rails = P[np.unique(T[M == mats.index(railways.STEEL)])]
+        edge = rails[np.abs(rails[:, 0] - 120.0) < 8.0]
+        self.assertTrue(len(edge))
+        self.assertLess(float(edge[:, 2].max()), flat(edge[:1, :2])[0] + railways.FLUSH_LIFT_M + 0.08, "flush")
+
+    def test_level_crossing_kits_face_each_approach(self):
+        """A secondary road's crossing gets a gate at each approach, on the kerb side of the traffic before the track,
+        facing it; a residential street's a cross; an abandoned line's none."""
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(120.0, 0.0), (120.0, 250.0)], [(40.0, 0.0), (40.0, 250.0)],
+                      [(0.0, 180.0), (250.0, 180.0)]],
+                     ["standard_gauge", "secondary", "residential", "unknown"], subtypes=["rail", "road", "road", "rail"],
+                     flags=[(3, "is_abandoned")])
+        rows = railways.crossing_props(FRAME, 0, 0, [f], lambda xy: np.full(len(xy), 10.0))
+        gates = [r for r in rows if r[0].startswith("rrgate")]
+        crosses = [r for r in rows if r[0].startswith("rrcross")]
+        self.assertEqual(len(gates), 2, rows)
+        self.assertEqual(len(crosses), 2, rows)
+        for g, x, y, z, yaw, *_ in gates:
+            self.assertGreater(abs(y - 100.0), 3.0, "before the track")
+            self.assertLess(abs(y - 100.0), 8.0)
+            # (the kerb side: right of the traffic heading for the track; its local +x points there)
+            travel = np.array([0.0, 1.0 if y < 100.0 else -1.0])
+            right = np.array([travel[1], -travel[0]])
+            self.assertGreater((x - 120.0) * right[0], 0.0, "on the right of the traffic")
+            ux = np.array([math.cos(math.radians(yaw)), math.sin(math.radians(yaw))])
+            np.testing.assert_allclose(ux, right, atol=1e-6)
+            self.assertEqual(z, 10.0)
+        left = railways.crossing_props(FRAME, 0, 0, [f], lambda xy: np.full(len(xy), 10.0), left_hand=True)
+        self.assertTrue(all(r[0].endswith("_l") for r in left if r[0].startswith("rrgate")))
+
+    def test_light_rail_crossings_only_with_data(self):
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(120.0, 0.0), (120.0, 250.0)]], ["light_rail", "secondary"],
+                     subtypes=["rail", "road"])
+        ground = lambda xy: np.zeros(len(xy))     # noqa: E731
+        self.assertEqual(railways.crossing_props(FRAME, 0, 0, [f], ground), [], "a street's light rail: none")
+        rows = railways.crossing_props(FRAME, 0, 0, [f], ground, kits=lambda p, c: "gate")
+        self.assertEqual(len(rows), 2, "the inventory says gates")
+
+    def test_osm_railway_tags_decide_when_known(self):
+        """The weekly rail file's OSM values (railtags.py): proposed out whatever Overture's class, disused worn, a
+        gauge in mm; a crossing node's devices."""
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(0.0, 120.0), (250.0, 120.0)], [(0.0, 140.0), (250.0, 140.0)]],
+                     ["standard_gauge", "standard_gauge", "unknown"], subtypes=["rail"] * 3)
+        f.attrs["osm_railway"] = np.array(["proposed", "disused", "rail"], object)
+        f.attrs["osm_gauge"] = np.array([None, None, "1520"], object)
+        self.assertIsNone(railways.drawn(f, 0))
+        self.assertEqual(railways.drawn(f, 1), ("standard_gauge", 1))
+        self.assertEqual(railways.drawn(f, 2), ("standard_gauge", 0))
+        self.assertAlmostEqual(railways.osm_gauge(f, 2), 1.52)
+        self.assertEqual(railways.osm_kit_of({"railway": "level_crossing", "crossing:barrier": "half"}), "gate")
+        self.assertEqual(railways.osm_kit_of({"railway": "level_crossing", "crossing:light": "yes"}), "flash")
+        self.assertEqual(railways.osm_kit_of({"crossing:barrier": "no", "crossing:light": "no"}), "cross")
+        self.assertIsNone(railways.osm_kit_of({"railway": "level_crossing"}), "no word: the road class's")
+
+    def test_rail_trail_is_not_drawn(self):
+        """An abandoned line that is now a road or path (OSM railway=abandoned + highway=*: the Via Verda d'Alcoi,
+        GitHub #1103) has no rails; an abandoned line with no highway tag stays drawn, worn."""
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(0.0, 120.0), (250.0, 120.0)], [(0.0, 140.0), (250.0, 140.0)]],
+                     ["standard_gauge"] * 3, subtypes=["rail"] * 3)
+        f.attrs["osm_railway"] = np.array(["abandoned", "abandoned", "rail"], object)
+        f.attrs["osm_highway"] = np.array(["track", None, "service"], object)
+        self.assertIsNone(railways.drawn(f, 0))
+        self.assertEqual(railways.drawn(f, 1), ("standard_gauge", 2))
+        self.assertEqual(railways.drawn(f, 2), ("standard_gauge", 0), "a street running track in use is drawn")
+
+    def test_proposed_and_unbuilt_lines_are_not_drawn(self):
+        """Overture's "unknown" rail with no abandoned or disused flag is OpenStreetMap's railway=proposed or
+        construction (Link Union Station across US-101, 2026-10-27); a line under construction neither."""
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(0.0, 120.0), (250.0, 120.0)], [(0.0, 140.0), (250.0, 140.0)],
+                      [(0.0, 160.0), (250.0, 160.0)]],
+                     ["unknown", "standard_gauge", "unknown", "standard_gauge"], subtypes=["rail"] * 4,
+                     flags=[(1, "is_under_construction"), (2, "is_disused"), (3, "is_disused")])
+        # Even if OSM tags the way as "rail", an under-construction line must not be drawn
+        f.attrs["osm_railway"] = np.array([None, "rail", "disused", "disused"], object)
+        worn = {}
+        got = sorted({fid for fid, *_ in railways.parts(FRAME, [f], roads.tile_bbox(0, 0), worn=worn)})
+        self.assertEqual(got, ["id002", "id003"])
+        self.assertEqual(worn, {"id002": 1, "id003": 1})
+
+    def test_abandoned_line_loses_some_sleepers_the_same_in_every_tile(self):
+        xy = np.c_[np.arange(0.0, 60.0, 2.0), np.zeros(30)]
+        s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+        u = np.tile([0.0, 1.0], (30, 1))
+        top = np.zeros(30)
+        full = railways._sleepers(s, xy, u, top, 0, 29)[0]
+        some = railways._sleepers(s, xy, u, top, 0, 29, railways.SLEEPERS_GONE[2])[0]
+        part = railways._sleepers(s, xy, u, top, 10, 29, railways.SLEEPERS_GONE[2])[0]
+        self.assertTrue(0.55 * len(full) < len(some) < 0.85 * len(full), (len(some), len(full)))
+        np.testing.assert_allclose(some[some[:, 0] >= s[10]], part, err_msg="a tile's run keeps the same ones")
+
+    def test_short_piece_on_its_own_is_left_out(self):
+        f = features([[(0.0, 100.0), (120.0, 100.0)], [(120.0, 100.0), (250.0, 100.0)], [(50.0, 130.0), (62.0, 130.0)]],
+                     ["standard_gauge"] * 3, subtypes=["rail"] * 3)
+        got = sorted(fid for fid, *_ in railways.parts(FRAME, [f], roads.tile_bbox(0, 0)))
+        self.assertEqual(got, ["id000", "id001"], "the 12 m stub goes, two short joined pieces of a line stay")
+
+    def test_road_high_over_the_track_does_not_cut_it(self):
+        f = features([[(0.0, 100.0), (250.0, 100.0)], [(120.0, 0.0), (120.0, 250.0)]], ["standard_gauge", "secondary"],
+                     subtypes=["rail", "road"])
+
+        def cutting(xy):            # the track 7 m down a cutting, the road on its own level over it
+            return np.where(np.abs(xy[:, 1] - 100.0) < 12.0, 10.0, 17.0)
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], cutting)
+        x = P[np.unique(T[M == 2])][:, 0]
+        self.assertTrue(((x > 115) & (x < 125)).any(), "the rails go on under the road")
+
+    def test_bed_smooths_bumps_but_follows_hills(self):
+        s = np.arange(0.0, 400.0, railways.STEP_M)
+        z = 0.05 * s + 0.4 * np.sin(s / 3.0)
+        zb = railways.bed_heights(z)
+        mid = slice(20, -20)
+        self.assertLess(np.abs(zb - 0.05 * s)[20:-20].max(), 0.1, "the bumps gone")
+        self.assertLess(np.abs(zb - 0.05 * s).max(), 0.3, "the grade kept to the ends")
+
+    def _bed(self, f, ground):
+        rails = railways.parts(FRAME, [f], roads.tile_bbox(0, 0))
+        prof = railways.profile(rails, ground)
+        return rails, prof
+
+    def _line(self, ground):
+        f = features([[(-400.0, 100.0), (100.0, 100.0)], [(100.0, 100.0), (150.0, 100.0)],
+                      [(150.0, 100.0), (640.0, 100.0)]], ["standard_gauge"] * 3, subtypes=["rail"] * 3,
+                     flags=[(1, "is_bridge")])
+        rails, prof = self._bed(f, ground)
+        pts = np.concatenate([xy for *_, xy in rails])
+        z = np.concatenate([zb for zb, _ in prof])
+        o = np.argsort(pts[:, 0])
+        return f, pts[o, 0], z[o]
+
+    def test_a_deck_up_a_steep_line_does_not_lift_the_track_below(self):
+        """GitHub #1051, Andermatt: a rack railway climbing ~10 % from the station to a bridge up the slope; the deck's
+        height, carried down the track at GRADE, stood the station's tracks 14 m over their own ground. A deck at its
+        line's level lifts nothing: the track below keeps its own bed."""
+        def slope(xy):          # level to x = -100 (the station), then 10 % up
+            return 1000.0 + 0.10 * np.maximum(xy[:, 0] + 100.0, 0.0)
+        f, x, z = self._line(slope)
+        ground = slope(np.c_[x, np.zeros(len(x))])
+        station = x < -150
+        self.assertLess(float(np.abs(z[station] - ground[station]).max()), 0.5, "the station on its own ground")
+
+    def test_bridge_over_a_dip_keeps_the_line_level(self):
+        """A short bridge over a stream or an underpass road (the ground 3 m down under it): the deck straight at the
+        line's height, no ramps (a 6 m clearance stood an 8 m culvert's track 6.8 m up on 4.5 m ramps, 2026-10-25)."""
+        def dip(xy):
+            return np.where((xy[:, 0] > 112) & (xy[:, 0] < 138), 7.0, 10.0)
+        f, x, z = self._line(dip)
+        self.assertLess(np.abs(z - 10.0).max(), 0.05, "on the ground's level everywhere, the bridge too")
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], dip)
+        piers = P[np.unique(T[M == 1])]
+        self.assertTrue(((piers[:, 2] < 7.0) & (piers[:, 0] > 100) & (piers[:, 0] < 150)).any(),
+                        "a pier down to the stream bed")
+
+    def test_bridge_ends_down_a_cutting_take_the_tracks_level(self):
+        """The Abbey Line over the M1 near Bricket Wood (the user's screenshot, 2026-10-31): the track level on both
+        sides, the mapped bridge's ends part way down the motorway cutting's slopes. The deck at the track's level, not
+        laid between those low ends (it blocked the motorway)."""
+        def cutting(xy):            # the track at 10 m, the cutting 6 m deep: its floor 50 m wide, its slopes 15 m
+            return 10.0 - 6.0 * np.clip((40.0 - np.abs(xy[:, 0] - 125.0)) / 15.0, 0.0, 1.0)
+        f, x, z = self._line(cutting)                       # (the bridge from 100 to 150: its ends at 5 m)
+        deck = (x >= 100) & (x <= 150)
+        self.assertLess(cutting(np.array([[100.0, 100.0]]))[0], 5.5, "(the mapped ends down the slopes)")
+        self.assertGreater(float(z[deck].min()), 10.0 - railways.GRADE * railways.APPROACH_REACH_M, "the deck up")
+        self.assertLess(float(z.max()), 10.0 + 0.05, "not over the track's own level")
+        dz = np.abs(np.diff(z)) / np.maximum(np.diff(x), 1e-9)
+        self.assertLessEqual(dz[np.diff(x) > 0.5].max(), railways.GRADE + 1e-6, "no step at the deck's ends")
+
+    def test_a_hillside_on_from_the_bridge_does_not_raise_it(self):
+        """The ground rising on from a bridge's ends without levelling out (the line climbs a hillside there): no
+        level the track holds, the deck stays at its ends' ground."""
+        def valley(xy):             # 8 % slopes up from the bridge's ends, a dip under it
+            x = xy[:, 0]
+            return np.where(x < 100, 10.0 + 0.08 * (100 - x), np.where(x > 150, 10.0 + 0.08 * (x - 150), 7.0))
+        self.assertEqual(railways.approach_levels(np.array([[100.0, 100.0], [150.0, 100.0]]), valley), (None, None))
+
+    def test_piers_stand_beside_a_road_under_the_bridge_on_the_ground(self):
+        """A rail bridge over a road in a 5 m dip: no pier in the road's lanes, every pier's foot under the ground at
+        all its corners (one stood in the lanes, one hung in the air, 2026-10-25)."""
+        f = features([[(-300.0, 100.0), (60.0, 100.0)], [(60.0, 100.0), (190.0, 100.0)],
+                      [(190.0, 100.0), (500.0, 100.0)], [(125.0, -100.0), (125.0, 300.0)]],
+                     ["standard_gauge"] * 3 + ["secondary"], subtypes=["rail"] * 3 + ["road"], flags=[(1, "is_bridge")])
+
+        def dip(xy):                # the ground falling 5 m to the road over 40 m either side of it
+            return 10.0 - 5.0 * np.clip(1.0 - np.abs(xy[:, 0] - 125.0) / 40.0, 0.0, 1.0)
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], dip)
+        con = P[np.unique(T[M == 1])]
+        low = con[con[:, 2] < 8.5]          # the piers' feet (the deck's underside: 10 + BALLAST_H - DECK_D = 8.9)
+        self.assertTrue(len(low), "piers there")
+        hw = roads.road_specs(f)[3].width / 2
+        self.assertFalse((np.abs(low[:, 0] - 125.0) < hw + 0.5).any(), "none in the road")
+        self.assertTrue((low[:, 2] <= dip(low[:, :2]) - railways.PIER_FOOT_M + 1e-6).all(), "all in the ground")
+
+    def test_a_pier_site_on_a_street_under_the_bridge_moves_off_it_and_its_footway(self):
+        """The North London line over Caledonian Road (the user's report, London 2026-11-12): a long embankment piece
+        mapped as a bridge, its pier every PIER_EVERY from the piece's start; the one that fell on the street stood on
+        its kerb (the level crossings' list, which the pier test read, has no road under a bridge). The site moves along
+        the deck off the street and the footway beside it."""
+        f = features([[(-300.0, 100.0), (0.0, 100.0)], [(0.0, 100.0), (300.0, 100.0)],
+                      [(100.0, -100.0), (100.0, 300.0)], [(108.0, -100.0), (108.0, 300.0)]],
+                     ["standard_gauge", "standard_gauge", "primary", "footway"],
+                     subtypes=["rail", "rail", "road", "road"], flags=[(1, "is_bridge")])
+
+        def embankment(xy):          # the line 6 m up, the street in the dip under it
+            return 10.0 - 6.0 * np.clip(1.0 - np.abs(xy[:, 0] - 100.0) / 30.0, 0.0, 1.0)
+        oa, ob, half = railways.pier_obstacles(FRAME, [f], roads.tile_bbox(0, 0))
+        self.assertTrue(len(oa), "the street and the footway are obstacles")
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], embankment)
+        con = P[np.unique(T[M == 1])]
+        feet = con[con[:, 2] < 4.5]                 # the piers' feet (the deck's underside is far over them)
+        self.assertTrue(len(feet), "the pier is moved, not left out")
+        street = roads.road_specs(f)[2].width / 2
+        clear = street + railways.PIER_ROAD_M
+        self.assertFalse((np.abs(feet[:, 0] - 100.0) < clear).any(), "none on the street or its kerb")
+        self.assertFalse((np.abs(feet[:, 0] - 108.0) < 1.0 + railways.PIER_ROAD_M).any(), "none on the footway")
+
+    def test_ground_through_a_deck_raises_it_on_gentle_ramps(self):
+        """Ground under a bridge's middle higher than its ends (bad data, or a ridge): the deck over it, the line
+        climbing to it at GRADE at most and back down to the ground past the ramps."""
+        def hump(xy):
+            return np.where((xy[:, 0] > 120) & (xy[:, 0] < 130), 11.0, 10.0)
+        f, x, z = self._line(hump)
+        deck = (x > 120) & (x < 130)
+        self.assertGreaterEqual(z[deck].min(), 11.0 - 1e-6)
+        dz = np.abs(np.diff(z)) / np.maximum(np.diff(x), 1e-9)
+        self.assertLessEqual(dz[np.diff(x) > 0.5].max(), railways.GRADE + 1e-6)
+        self.assertAlmostEqual(float(z[x < -300].max()), 10.0, 1, "back on the ground past the ramp")
+
+    def test_single_bad_sample_under_a_deck_does_not_raise_it_100m(self):
+        """One bad height under a bridge (an unfiltered building/tree in the surface model, a DEM spike: a rail
+        viaduct stood ~100 m up with its piers and graded embankment): the deck
+        rises over the chord between its ends by at most DECK_RAISE_MAX_M."""
+        def spike(xy):
+            return np.where((xy[:, 0] > 120) & (xy[:, 0] < 130), 110.0, 10.0)
+        f, x, z = self._line(spike)
+        chord = 10.0
+        self.assertLess(float(z.max()), chord + railways.DECK_RAISE_MAX_M + railways.GRADE * 25.0 + 1e-6)
+        dz = np.abs(np.diff(z)) / np.maximum(np.diff(x), 1e-9)
+        self.assertLessEqual(dz[np.diff(x) > 0.5].max(), railways.GRADE + 1e-6, "no step at the deck's ends")
+        self.assertLess(float(z[x > 500].max()) - 10.0, railways.SEED_LIFT_MAX_M,
+                        "the ramp to the capped deck stays bounded too")
+
+    def test_distant_high_deck_does_not_lift_a_ground_track_100m(self):
+        """A high deck must not lift kilometres of connected ground track (and the ground graded to it) with it:
+        the seeds' carry-over over a ground part's own bed is at most SEED_LIFT_MAX_M."""
+        f = features([[(-400.0, 100.0), (100.0, 100.0)], [(100.0, 100.0), (150.0, 100.0)],
+                      [(150.0, 100.0), (2000.0, 100.0)]], ["standard_gauge"] * 3, subtypes=["rail"] * 3,
+                     flags=[(1, "is_bridge")])
+
+        def plateau(xy):            # the bridge stands 90 m over the flat ground track on from it
+            return np.where(xy[:, 0] < 100.0, 100.0, 10.0)
+        rails, prof = self._bed(f, plateau)
+        grounds = [(len(xy), zb) for (_, _, kind, xy), (zb, _zg) in zip(rails, prof) if kind == "ground"]
+        self.assertTrue(grounds, "ground parts there")
+        _n, bed = max(grounds, key=lambda t: t[0])
+        self.assertLess(float(bed.max() - 10.0), railways.SEED_LIFT_MAX_M + 1e-6)
+        dz = np.abs(np.diff(bed)) / railways.STEP_M
+        self.assertLessEqual(float(dz.max()), railways.GRADE + 1e-6, "the ramp still climbs at GRADE at most")
+
+    def test_bridge_over_a_valley_runs_straight(self):
+        """A bridge over a 30 m deep valley between its banks: straight between them, piers down to the floor."""
+        f = features([[(-200.0, 100.0), (60.0, 100.0)], [(60.0, 100.0), (200.0, 100.0)],
+                      [(200.0, 100.0), (450.0, 100.0)]], ["standard_gauge"] * 3, subtypes=["rail"] * 3,
+                     flags=[(1, "is_bridge")])
+
+        def valley(xy):
+            x = xy[:, 0]
+            return np.where((x > 70) & (x < 190), -20.0, 10.0 + 0.01 * x)
+        rails, prof = self._bed(f, valley)
+        (zb, zg), = [p for p, (_, _, k, _) in zip(prof, rails) if k == "bridge"]
+        line = np.linspace(zb[0], zb[-1], len(zb))
+        self.assertLess(np.abs(zb - line).max(), 0.3)
+        self.assertAlmostEqual(zb[0], 10.6, 0)
+        self.assertAlmostEqual(zb[-1], 12.0, 0)
+        P, T, UV, mats, M = railways.tile_mesh(FRAME, 0, 0, [f], valley)
+        self.assertLess(P[np.unique(T[M == 1])][:, 2].min(), -20.0)
+
+    def test_track_follows_a_hill(self):
+        f = features([[(-100.0, 100.0), (400.0, 100.0)]], ["standard_gauge"], subtypes=["rail"])
+
+        def hill(xy):
+            return 10.0 + 0.015 * xy[:, 0]
+        rails, prof = self._bed(f, hill)
+        zb, zg = prof[0]
+        self.assertLess(np.abs(zb - zg)[10:-10].max(), 0.05)
+
+    def test_ground_graded_to_the_bed(self):
+        """A line through a 6 m ridge (a rock cutting the DEM half shows): the grader lays the ground to the track's
+        bed, the walls back from it, so the track is not buried (2026-10-25: half a track under the rock)."""
+        import grading
+        from test_grading import FakeMD
+        f = features([[(-400.0, 0.0), (400.0, 0.0)]], ["standard_gauge"], subtypes=["rail"])
+
+        def ridge(la, lo):
+            e, _n, _ = FRAME.geodetic_to_enu(np.asarray(la), np.asarray(lo), 0.0)
+            return 10.0 + 6.0 * np.exp(-(np.asarray(e) / 40.0) ** 2)
+        g = grading.Grader(FRAME, FakeMD(f), ridge)
+        e = np.linspace(-60.0, 60.0, 25)
+        for off in (0.0, 1.5, -1.5):
+            la, lo, _ = FRAME.enu_to_geodetic(e, np.full(len(e), off), 0.0)
+            raw = ridge(la, lo)
+            got = g.apply(la, lo, raw)
+            rails = railways.parts(FRAME, [f], (-60, -10, 60, 10))
+            import railprofile      # (the bed is railprofile's: smoothed over the ridge, the cut at most MAX_CUT_M)
+            railprofile._NODES.clear()
+            (zb,) = railprofile.beds(FRAME, "ridge", lambda k: f, lambda xy: ridge(*FRAME.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)[:2]), rails)
+            want = np.interp(e, rails[0][3][:, 0], zb)
+            self.assertLess(np.abs(got - want).max(), 0.1, f"the ground at {off} m off the line is at its bed")
+            self.assertLess(abs(float(got[12]) - float(raw[12])), railprofile.MAX_CUT_M + 0.3,
+                            "over the ridge as it is, cut by the smoothing at most")
+        self.assertLess(railways.FOOT_MAX_M, 10.0)
+
+    def test_written_with_the_tile(self):
+        f = features([[(-50.0, 100.0), (300.0, 100.0)]], ["standard_gauge"], subtypes=["rail"])
+        mesh = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        with tempfile.TemporaryDirectory() as d:
+            roads.write_tile(d, "/vfs", 1, 0, 0, [], rail_mesh=mesh)
+            self.assertTrue(os.path.exists(os.path.join(d, "rail_1_0_0.cdae")))
+            self.assertIn("rail", roads.shape_files(1, 0, 0))
+
+
+
+class RoadUnderpassTest(unittest.TestCase):
+    """A tunnel flag on the lower road must also keep the railway above it open."""
+
+    def setUp(self):
+        railways._GROUND_MEMO.clear()
+
+    def tearDown(self):
+        railways._GROUND_MEMO.clear()
+
+    def features(self, split=False, tunnel=True, parallel=False):
+        track = [[(-200, 100), (120, 100)], [(120, 100), (450, 100)]] if split else [[(-200, 100), (450, 100)]]
+        road = [(110, 90), (130, 90)] if parallel else [(120, 90), (120, 110)]
+        return features(track + [road], ["standard_gauge"] * len(track) + ["secondary"],
+                        subtypes=["rail"] * len(track) + ["road"],
+                        flags=[(len(track), "is_tunnel")] if tunnel else [])
+
+    def test_span_replaces_embankment_and_has_clearance(self):
+        f = self.features()
+        box = roads.tile_bbox(0, 0)
+        tunnels = railways.road_underpasses(FRAME, [f], box)
+        parts = railways.parts(FRAME, [f], box)
+        self.assertTrue(any(p[2] == "bridge" for p in parts))
+        prof = railways.profile(parts, flat, tunnels)
+        for (_, _, kind, xy), (z, _) in zip(parts, prof):
+            self.assertLessEqual(float((np.abs(np.diff(z)) / np.diff(railways._arc(xy))).max()),
+                                 railways.GRADE + 1e-6)
+            if kind == "bridge":
+                self.assertGreaterEqual(float(z.min() + railways.BALLAST_H - railways.DECK_D),
+                                        10 + railways.UNDERPASS_CLEAR_M - 0.5)
+        P, T, _uv, _mats, _M = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        # Check all vertices belonging to triangles over the actual lower lane,
+        # including ballast skirts, the concrete deck, and support piers.
+        tri = P[T]
+        x = float(tunnels[0][0][:, 0].mean())
+        over = (tri[:, :, 0].min(1) < x + 3) & (tri[:, :, 0].max(1) > x - 3)
+        self.assertTrue(over.any())
+        self.assertGreater(float(tri[over, :, 2].min()), 10 + railways.UNDERPASS_CLEAR_M - 0.1)
+
+    def test_no_bridge_for_level_crossing_or_parallel_track(self):
+        for f in (self.features(tunnel=False), self.features(parallel=True)):
+            self.assertTrue(all(p[2] == "ground" for p in railways.parts(FRAME, [f], roads.tile_bbox(0, 0))))
+
+    def test_tunnel_ending_beside_track_does_not_create_a_bridge(self):
+        f = features([[(-200, 100), (450, 100)], [(120, 80), (120, 94)]],
+                     ["standard_gauge", "secondary"], subtypes=["rail", "road"], flags=[(1, "is_tunnel")])
+        self.assertTrue(all(p[2] == "ground" for p in railways.parts(FRAME, [f], roads.tile_bbox(0, 0))))
+
+    def test_feature_split_and_adjacent_tiles_keep_the_same_span(self):
+        f = self.features(split=True)
+        a = railways.parts(FRAME, [f], (0, 0, 256, 256))
+        b = railways.parts(FRAME, [f, f], (256, 0, 512, 256))
+        spans_a = [(p[0], p[3]) for p in a if p[2] == "bridge"]
+        spans_b = [(p[0], p[3]) for p in b if p[2] == "bridge"]
+        self.assertEqual(len(spans_a), 2)
+        self.assertEqual(len(spans_a), len(spans_b))
+        for (fa, xa), (fb, xb) in zip(spans_a, spans_b):
+            self.assertEqual(fa, fb)
+            np.testing.assert_array_equal(xa, xb)
+        np.testing.assert_allclose(spans_a[0][1][-1], spans_a[1][1][0], atol=1e-8)
+
+    def test_grading_keeps_lower_road_at_its_floor(self):
+        from types import SimpleNamespace
+        import grading
+        f = self.features()
+        md = SimpleNamespace(cell=lambda *a, **kw: SimpleNamespace(layers={"roads": f}))
+        def embankment(la, lo):
+            e, _, _ = FRAME.geodetic_to_enu(np.asarray(la), np.asarray(lo), 0.0)
+            return np.where(np.abs(e - 120.0) < 7.0, 10.0, 15.0)
+        g = grading.Grader(FRAME, md, embankment)
+        ring = f.parts(len(f) - 1)[0][0]
+        e, n, _ = FRAME.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
+        xy = np.c_[e, n]
+        line = railways._resample(xy, 1.0)
+        la, lo, _ = FRAME.enu_to_geodetic(line[:, 0], line[:, 1], 0.0)
+        z = g.apply(la, lo, np.full(len(la), 10.0), grading.ROAD_LIFT)
+        self.assertLess(float(np.abs(z - (10 + grading.ROAD_LIFT)).max()), 0.2,
+                        "rail approach grading must not refill the lower road")
+
+
+
+class UnderpassNeighbourTest(unittest.TestCase):
+    """Only the track actually over the road gets a span and its clearance."""
+
+    def test_return_decks_hands_the_bridge_decks_to_fences(self):
+        # fences.py stands mapped noise walls on these instead of the ground under them.
+        f = features([[(-400.0, 100.0), (100.0, 100.0)], [(100.0, 100.0), (150.0, 100.0)],
+                      [(150.0, 100.0), (640.0, 100.0)]], ["standard_gauge"] * 3, subtypes=["rail"] * 3,
+                     flags=[(1, "is_bridge")])
+        mesh, decks = railways.tile_mesh(FRAME, 0, 0, [f], flat, return_decks=True)
+        self.assertIsNotNone(mesh)
+        self.assertEqual(len(decks), 1)
+        line = np.asarray(decks[0]["n"], np.float64)
+        self.assertEqual(line.shape[1], 3)
+        self.assertLess(abs(float(line[:, 2].mean()) - (10.0 + railways.BALLAST_H)), 0.6)
+        self.assertEqual(decks[0]["w"], 2 * railways.DECK_HALF_M)
+        self.assertIsNone(railways.tile_mesh(FRAME, 0, 0, [], flat, return_decks=True)[0])
+        plain = railways.tile_mesh(FRAME, 0, 0, [f], flat)
+        self.assertEqual(len(plain), 5, "without return_decks the mesh tuple is unchanged")
+
+    def test_a_rail_bridge_under_a_model_bridge_is_not_drawn(self):
+        """GitHub #1071: Perth's Narrows and Mount Henry bridges' 3dmr models carry their railways; the rail decks were
+        drawn through them. The bridge is left out, the track on the ground either side stays."""
+        f = features([[(-400.0, 100.0), (100.0, 100.0)], [(100.0, 100.0), (150.0, 100.0)],
+                      [(150.0, 100.0), (640.0, 100.0)]], ["standard_gauge"] * 3, subtypes=["rail"] * 3,
+                     flags=[(1, "is_bridge")])
+        model = lambda xy: (np.asarray(xy)[:, 0] > 95.0) & (np.asarray(xy)[:, 0] < 155.0)    # noqa: E731
+        mesh, decks = railways.tile_mesh(FRAME, 0, 0, [f], flat, return_decks=True, under=model)
+        self.assertIsNotNone(mesh)
+        self.assertEqual(decks, [])
+        P = mesh[0]
+        self.assertFalse(((P[:, 0] > 105.0) & (P[:, 0] < 145.0)).any(), "nothing of the bridge")
+        self.assertTrue((P[:, 0] < 90.0).any() and (P[:, 0] > 160.0).any(), "the track either side")
+        mesh, decks = railways.tile_mesh(FRAME, 0, 0, [f], flat, return_decks=True,
+                                         under=lambda xy: np.zeros(len(xy), bool))
+        self.assertEqual(len(decks), 1)
+
+    def test_non_crossing_neighbour_stays_on_ground(self):
+        for y in (114.0, 122.0):
+            with self.subTest(neighbour_y=y):
+                f = features([[(-200, 100), (450, 100)], [(-200, y), (450, y)],
+                              [(120, 90), (120, 110)]],
+                             ["standard_gauge", "standard_gauge", "secondary"],
+                             subtypes=["rail", "rail", "road"], flags=[(2, "is_tunnel")])
+                box = roads.tile_bbox(0, 0)
+                parts = railways.parts(FRAME, [f], box)
+                neighbour = str(f.ids[1])
+                selected = [p for p in parts if p[0] == neighbour]
+                self.assertTrue(selected)
+                self.assertTrue(all(p[2] == "ground" for p in selected))
+                profiles = railways.profile(parts, flat, railways.road_underpasses(FRAME, [f], box))
+                for part, (bed, _) in zip(parts, profiles):
+                    if part[0] == neighbour:
+                        np.testing.assert_allclose(bed, 10.0, atol=1e-6)
+
+    def test_existing_neighbour_bridge_keeps_its_height(self):
+        f = features([[(-200, 100), (450, 100)], [(-200, 114), (450, 114)],
+                      [(120, 90), (120, 110)]],
+                     ["standard_gauge", "standard_gauge", "secondary"],
+                     subtypes=["rail", "rail", "road"], flags=[(1, "is_bridge"), (2, "is_tunnel")])
+        box = roads.tile_bbox(0, 0)
+        parts = railways.parts(FRAME, [f], box)
+        profiles = railways.profile(parts, flat, railways.road_underpasses(FRAME, [f], box))
+        neighbour = [(part, bed) for part, (bed, _) in zip(parts, profiles) if part[0] == str(f.ids[1])]
+        self.assertTrue(neighbour)
+        for part, bed in neighbour:
+            self.assertEqual(part[2], "bridge")
+            np.testing.assert_allclose(bed, 10.0, atol=1e-6,
+                                       err_msg="a tunnel under a different track must not raise this bridge")
+
+    def test_track_connected_far_away_does_not_get_another_span(self):
+        # Both parallel legs belong to one feature, joined 330 m from the crossing.
+        f = features([[(-200, 100), (450, 100), (450, 122), (-200, 122)],
+                      [(120, 90), (120, 110)]], ["standard_gauge", "secondary"],
+                     subtypes=["rail", "road"], flags=[(1, "is_tunnel")])
+        spans = [p[3] for p in railways.parts(FRAME, [f], roads.tile_bbox(0, 0)) if p[2] == "bridge"]
+        self.assertTrue(spans)
+        self.assertTrue(all(float(xy[:, 1].max()) < 101 for xy in spans),
+                        "the returning leg beside the tunnel is not another crossing")
+
+    def test_span_continues_across_a_feature_split_beside_crossing(self):
+        for split in (110, 114, 120, 126, 130):
+            with self.subTest(split=split):
+                f = features([[(-200, 100), (split, 100)], [(split, 100), (450, 100)],
+                              [(120, 90), (120, 110)]],
+                             ["standard_gauge", "standard_gauge", "secondary"],
+                             subtypes=["rail", "rail", "road"], flags=[(2, "is_tunnel")])
+                a = [p for p in railways.parts(FRAME, [f], roads.tile_bbox(0, 0)) if p[2] == "bridge"]
+                b = [p for p in railways.parts(FRAME, [f, f], roads.tile_bbox(1, 0)) if p[2] == "bridge"]
+                self.assertEqual({p[0] for p in a}, {str(f.ids[0]), str(f.ids[1])})
+                self.assertEqual(len(a), len(b))
+                for pa, pb in zip(a, b):
+                    self.assertEqual(pa[:3], pb[:3])
+                    np.testing.assert_array_equal(pa[3], pb[3])
+                np.testing.assert_allclose(a[0][3][-1], a[1][3][0], atol=1e-6)
+
+    def test_two_tracks_really_crossing_the_tunnel_both_get_clearance(self):
+        f = features([[(-200, 100), (450, 100)], [(-200, 108), (450, 108)],
+                      [(120, 90), (120, 118)]],
+                     ["standard_gauge", "standard_gauge", "secondary"],
+                     subtypes=["rail", "rail", "road"], flags=[(2, "is_tunnel")])
+        box = roads.tile_bbox(0, 0)
+        parts = railways.parts(FRAME, [f], box)
+        profiles = railways.profile(parts, flat, railways.road_underpasses(FRAME, [f], box))
+        raised = {part[0] for part, (bed, _) in zip(parts, profiles)
+                  if part[2] == "bridge" and float(bed.max()) > 14.0}
+        self.assertEqual(raised, {str(f.ids[0]), str(f.ids[1])})
+
+
+class GroundMemoTest(unittest.TestCase):
+    def test_a_points_height_whatever_point_asked_first(self):
+        """The heights kept per centimetre (point_ground's, grade_plans'): the centimetre's own point's, not the first
+        point that asked in it. Two cells' copies of a line lie ~1e-5 m apart, and a cell's rail beds were the first
+        planned cell's (2026-11-12)."""
+        def slope(la, lo):
+            e, n, _ = FRAME.geodetic_to_enu(np.asarray(la), np.asarray(lo), 0.0)
+            return 10.0 + 0.5 * np.asarray(e) + 0.25 * np.asarray(n)
+        p, q = np.array([[12.3401, -4.5601]]), np.array([[12.3449, -4.5649]])     # (one centimetre)
+        a = railways.point_ground(FRAME, slope, ("test-a",))
+        b = railways.point_ground(FRAME, slope, ("test-b",))
+        self.assertEqual(float(a(p)[0]), float(b(q)[0]))
+        self.assertEqual(float(a(q)[0]), float(b(p)[0]))
+        self.assertEqual(float(a(p)[0]), float(railways.point_ground(FRAME, slope)(np.array([[12.34, -4.56]]))[0]))
+
+    def test_a_short_reads_heights_are_not_kept(self):
+        """A height read short (revisit.fault: a lidar sheet not there yet) is asked again, not served from the memo with
+        no fault: the rebuild on the full DEM would otherwise be kept with the short heights (review of #1248)."""
+        import revisit
+        short = [True]
+
+        def elev(la, lo):
+            if short[0]:
+                revisit.fault()
+                return np.zeros(np.shape(la))
+            return np.full(np.shape(la), 7.0)
+        g = railways.point_ground(FRAME, elev, ("test-short",))
+        p = np.array([[1.0, 2.0]])
+        self.assertAlmostEqual(float(g(p)[0]), 0.0, places=3)
+        short[0] = False
+        with revisit.scope() as b:
+            self.assertAlmostEqual(float(g(p)[0]), 7.0, places=3)
+        self.assertTrue(b.complete)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class CoarseUnderpassTest(unittest.TestCase):
+    """GitHub #414: on coarse elevation a rail bridge over a ground road rises over it (railways.coarse_underpasses)."""
+
+    def test_crossings_are_found_along_the_road(self):
+        road = np.array([[0.0, 0.0], [100.0, 0.0]])
+        rail = np.array([[40.0, -20.0], [40.0, 20.0]])
+        self.assertEqual([round(v, 6) for v in railways._seg_hits(road, rail)], [40.0])
+        self.assertEqual(railways._seg_hits(road, rail + [0.0, 50.0]), [])
+
+    @staticmethod
+    def _loop_hits(a, b):
+        """The crossings one pair of segments at a time: what _seg_hits must give, in this order."""
+        out = []
+        sa = railways._arc(a)
+        for i in range(len(a) - 1):
+            p, r = a[i], a[i + 1] - a[i]
+            for j in range(len(b) - 1):
+                q, t = b[j], b[j + 1] - b[j]
+                den = r[0] * t[1] - r[1] * t[0]
+                if abs(den) < 1e-12:
+                    continue
+                u = ((q[0] - p[0]) * t[1] - (q[1] - p[1]) * t[0]) / den
+                v = ((q[0] - p[0]) * r[1] - (q[1] - p[1]) * r[0]) / den
+                if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+                    out.append(float(sa[i] + u * (sa[i + 1] - sa[i])))
+        return out
+
+    def test_crossings_as_one_pair_of_segments_at_a_time(self):
+        rng = np.random.default_rng(414)
+        found = 0
+        for _ in range(300):
+            a = np.cumsum(rng.normal(0.0, 6.0, (int(rng.integers(2, 12)), 2)), 0)
+            b = np.cumsum(rng.normal(0.0, 6.0, (int(rng.integers(2, 12)), 2)), 0) + rng.normal(0.0, 5.0, 2)
+            want = self._loop_hits(a, b)
+            found += len(want)
+            self.assertEqual(railways._seg_hits(a, b), want)
+        self.assertGreater(found, 100)
+        road = np.array([[0.0, 0.0], [50.0, 0.0], [100.0, 0.0], [100.0, 40.0]])
+        for rail in (road + [0.0, 3.0],                                    # parallel beside it
+                     road.copy(),                                           # the same line
+                     np.array([[50.0, -10.0], [50.0, 10.0]]),               # through a vertex: both segments meet it
+                     np.array([[20.0, 0.0], [20.0, 10.0]]),                 # ends on the road
+                     np.array([[20.0, 5.0]]), np.zeros((0, 2))):            # no segment
+            self.assertEqual(railways._seg_hits(road, rail), self._loop_hits(road, rail))
+        self.assertEqual(railways._seg_hits(road, np.array([[50.0, -10.0], [50.0, 10.0]])), [50.0, 50.0])
+
+    def test_long_lines_in_runs_give_the_same_crossings(self):
+        t = np.linspace(0.0, 60.0, 400)
+        a = np.c_[10.0 * t, 30.0 * np.sin(t)]
+        b = np.c_[10.0 * t, 30.0 * np.cos(1.3 * t)]
+        want = self._loop_hits(a, b)
+        self.assertGreater(len(want), 20)
+        with mock.patch.object(railways, "SEG_HITS_PAIRS", 1000):          # (two of a's segments per run)
+            self.assertEqual(railways._seg_hits(a, b), want)
+        self.assertEqual(railways._seg_hits(a, b), want)
+
+    def test_parts_away_from_a_road_change_nothing(self):
+        import geodesy
+        frame = geodesy.EnuFrame(22.41, 114.21, 0.0)
+        road = np.array([[0.0, 0.0], [100.0, 0.0], [200.0, 30.0]])
+        side = np.array([[-50.0, 300.0], [250.0, 300.0]])                   # a road no part crosses
+        over = [("a", "rail", "bridge", np.array([[40.0, -20.0], [40.0, 20.0]])),
+                ("b", "rail", "bridge", np.array([[150.0, 60.0], [150.0, -60.0], [160.0, -60.0], [160.0, 60.0]]))]
+        away = [("c", "rail", "bridge", np.array([[900.0, -20.0], [900.0, 20.0]])),
+                ("d", "rail", "bridge", np.array([[40.0, 500.0], [40.0, 540.0]])),
+                ("e", "rail", "ground", np.array([[70.0, -20.0], [70.0, 20.0]])),      # not a bridge
+                ("f", "rail", "bridge", np.array([[-400.0, -400.0], [-300.0, -300.0]]))]
+        with mock.patch.object(railways, "COARSE_AT", lambda la, lo: True), \
+                mock.patch.object(railways, "crossings", lambda *a, **k: [(road, 3.5), (side, 2.0)]):
+            few = railways.coarse_underpasses(frame, [], (0, 0, 10, 10), over)
+            many = railways.coarse_underpasses(frame, [], (0, 0, 10, 10), away[:2] + [over[0]] + away[2:] + [over[1]])
+        self.assertEqual(len(few), 3)                                      # one crossing of a, two of b
+        self.assertEqual(len(many), len(few))
+        for (xy, half), (xy2, half2) in zip(few, many):
+            self.assertTrue(np.array_equal(xy, xy2))
+            self.assertEqual(half, half2)
+            self.assertEqual(half, 3.5 + railways.UNDERPASS_SIDE_M)
+        self.assertLess(abs(float(few[0][0].mean(0)[0]) - 40.0), 1e-6)     # each piece centred on its crossing
+        self.assertLess(abs(float(few[1][0][:, 0].mean()) - 150.0), 1.0)
+
+    def test_only_on_coarse_elevation(self):
+        import geodesy
+        frame = geodesy.EnuFrame(58.1, 56.4, 0.0)
+        saved = railways.COARSE_AT
+        try:
+            railways.COARSE_AT = None
+            self.assertFalse(railways._coarse_here(frame, (0, 0, 10, 10)))
+            railways.COARSE_AT = lambda la, lo: True
+            self.assertTrue(railways._coarse_here(frame, (0, 0, 10, 10)))
+            self.assertEqual(railways.coarse_underpasses(frame, [], (0, 0, 10, 10), []), [])   # no rail bridge
+        finally:
+            railways.COARSE_AT = saved
+
+
+class SplitMeshTest(unittest.TestCase):
+    """A tile's track past the engine's 16-bit indices is cut into shapes, none of its triangles lost."""
+
+    @staticmethod
+    def _mesh(n_quads):
+        # n_quads separate quads (4 vertices, 2 triangles each), each in its own material slot k % 3
+        P = np.zeros((4 * n_quads, 3))
+        T = np.zeros((2 * n_quads, 3), np.int64)
+        for q in range(n_quads):
+            P[4 * q:4 * q + 4] = [[q, 0, 0], [q + 1, 0, 0], [q + 1, 1, 0], [q, 1, 0]]
+            T[2 * q] = [4 * q, 4 * q + 1, 4 * q + 2]
+            T[2 * q + 1] = [4 * q, 4 * q + 2, 4 * q + 3]
+        return P, T, np.zeros((len(P), 2)), ["a", "b", "c"], np.arange(2 * n_quads) % 3
+
+    def test_small_mesh_unchanged(self):
+        m = self._mesh(10)
+        self.assertEqual(railways.split_mesh(m), [m])
+        self.assertEqual(railways.split_mesh(None), [])
+
+    def test_cut_under_the_limit_keeping_every_triangle(self):
+        m = self._mesh(5000)                                    # 20000 vertices
+        parts = railways.split_mesh(m, limit=6000, parts_max=10)
+        self.assertGreater(len(parts), 1)
+        self.assertTrue(all(len(p[0]) <= 6000 for p in parts))
+        self.assertEqual(sum(len(p[1]) for p in parts), len(m[1]))
+        # the same triangles, in the same order, with the same corners and materials
+        got = np.concatenate([p[0][p[1]] for p in parts])
+        want = m[0][m[1]]
+        np.testing.assert_array_equal(got, want)
+        np.testing.assert_array_equal(np.concatenate([p[4] for p in parts]), m[4])
+        for p in parts:
+            self.assertEqual(int(p[1].max()), len(p[0]) - 1)    # no unused vertex left in a part
+
+    def test_parts_max(self):
+        m = self._mesh(5000)
+        self.assertEqual(len(railways.split_mesh(m, limit=6000, parts_max=2)), 2)
+
+    def test_shape_names(self):
+        names = roads.shape_files(1, 2, 3)
+        for k in range(2, roads.RAIL_PARTS_MAX + 1):
+            self.assertEqual(names[f"rail{k}"], f"rail_1_2_3_{k}.cdae")
+            self.assertEqual(names[f"railcol{k}"], f"railcol_1_2_3_{k}.cdae")
+
+
+class StreetRunningTest(unittest.TestCase):
+    """A track down a street (Fells Point's disused trolley tracks in Thames Street, the user's reports 15 and 16)."""
+    TRACK = np.c_[np.arange(0.0, 101.0, railways.STEP_M), np.zeros(51)]
+
+    def test_a_street_the_track_runs_down_cuts_it(self):
+        street = (np.array([[-20.0, 1.5], [120.0, 1.5]]), 4.75)       # the track 1.5 m off its centre line
+        beside = (np.array([[-20.0, 9.0], [120.0, 9.0]]), 4.0)         # a road along the track, its edge 5 m off it
+        ending = (np.array([[50.0, 40.0], [50.0, 0.5]]), 4.0)          # a road ending at the track
+        crossing = (np.array([[70.0, -20.0], [70.0, 20.0]]), 3.0)
+        got = railways.true_crossers([self.TRACK], [street, beside, ending, crossing])
+        self.assertEqual([id(r[0]) for r in got], [id(street[0]), id(crossing[0])])
+
+    def test_street_spans_cover_the_stretch_in_the_street(self):
+        street = (np.array([[30.0, 1.0], [60.0, 1.0]]), 4.0)
+        spans = railways.street_spans(self.TRACK, [street], pad=4.0)
+        self.assertEqual(len(spans), 1)
+        a, b = spans[0]
+        self.assertTrue(20.0 <= a <= 30.0 and 60.0 <= b <= 70.0, spans)
+        self.assertEqual(railways.street_spans(self.TRACK, [(np.array([[30.0, 9.0], [60.0, 9.0]]), 4.0)]), [])
+
+    def test_no_crossbucks_on_a_street_track(self):
+        street = ("s", types.SimpleNamespace(width=9.5), np.array([[-20.0, 1.5], [120.0, 1.5]]))
+        side = ("x", types.SimpleNamespace(width=6.0), np.array([[50.0, -20.0], [50.0, 20.0]]))
+        self.assertTrue(railways._street_crossing(self.TRACK, np.array([50.0, 0.0]), {}, 0, [street, side]))
+        self.assertFalse(railways._street_crossing(self.TRACK, np.array([50.0, 0.0]), {}, 0, [side]))
+
+    def test_no_buffer_stop_in_the_street(self):
+        track = [("t", "standard_gauge", "ground", self.TRACK)]
+        finals = [np.zeros(len(self.TRACK))]
+        near = (-500.0, -500.0, 500.0, 500.0)
+        self.assertEqual(len(railways.dead_ends(track, finals, {"t": 1}, near)), 2)
+        street = (np.array([[90.0, -20.0], [90.0, 20.0]]), 12.0)       # the track's end at x = 100 on its carriageway
+        ends = railways.dead_ends(track, finals, {"t": 1}, near, [street])
+        self.assertEqual([round(float(p[0])) for p, _d, _z in ends], [0])

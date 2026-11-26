@@ -1,0 +1,835 @@
+"""Real road heights (roadz.py, earthfast roadz kernels; docs/research/2026-10-28-3d-road-data.md): source parsing,
+matching a map road to a source's 3D lines, profile cleaning, the lidar deck fit, the datum fit, and the overrides in
+BridgeProfiles / TunnelProfiles / grading with today's inference as the fallback."""
+import os
+import struct
+import sys
+import time
+import unittest
+
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import fast  # noqa: E402
+import grading  # noqa: E402
+import mapcells  # noqa: E402
+import roads  # noqa: E402
+import roadz  # noqa: E402
+from test_approaches import overpass, flat_elev, FLAT  # noqa: E402
+from test_roads import FRAME  # noqa: E402
+from test_grading import FakeMD  # noqa: E402
+
+ef = fast._ef
+NATIVE = fast.AVAILABLE and getattr(ef, "VERSION", 0) >= roadz.NATIVE
+
+
+class ParseTest(unittest.TestCase):
+    def test_ign(self):
+        feats = [
+            {"properties": {"position_par_rapport_au_sol": "1", "cpx_numero": "A75", "fictif": False},
+             "geometry": {"type": "LineString", "coordinates": [[3.02, 44.07, 676.1], [3.021, 44.071, -1000]]}},
+            {"properties": {"position_par_rapport_au_sol": "-1", "nom_collaboratif_gauche": "Tunnel X"},
+             "geometry": {"type": "MultiLineString", "coordinates": [[[3.0, 44.0, 10.0], [3.001, 44.0, 11.0]]]}},
+            {"properties": {"position_par_rapport_au_sol": "0", "fictif": True},
+             "geometry": {"type": "LineString", "coordinates": [[3.0, 44.0, 1.0], [3.1, 44.0, 2.0]]}},
+        ]
+        rows = roadz.parse_ign(feats)
+        self.assertEqual(len(rows), 2, "the fictitious link is left out")
+        ll, z, lvl, ref, name = rows[0]
+        self.assertEqual((lvl, ref), (1, "A75"))
+        self.assertAlmostEqual(z[0], 676.1)
+        self.assertTrue(np.isnan(z[1]), "Z -1000 is none")
+        self.assertEqual((rows[1][2], rows[1][4]), (-1, "Tunnel X"))
+
+    def test_nvdb(self):
+        objs = [{"geometri": {"wkt": "LINESTRING Z (59.90242713 10.75914291 -0.602, 59.90257539 10.75902247 -1.442)",
+                              "medium": "U"},
+                 "vegsystemreferanse": {"vegsystem": {"vegkategori": "E", "nummer": 18}}},
+                {"geometri": {"wkt": "LINESTRING Z (59.9 10.7 5.0, 59.91 10.7 6.0)", "medium": "L"}},
+                {"geometri": {"wkt": "LINESTRING Z (59.9 10.7 5.0, 59.91 10.7 6.0)"}}]
+        rows = roadz.parse_nvdb(objs)
+        self.assertEqual([r[2] for r in rows], [-1, 1, 0])
+        self.assertAlmostEqual(rows[0][0][0, 0], 10.75914291, msg="WKT is lat lon: lon first here")
+        self.assertAlmostEqual(rows[0][1][1], -1.442)
+        self.assertEqual(rows[0][3], "E18")
+
+    def test_lines_roundtrip(self):
+        ln = roadz.Lines.build([(np.array([[0.0, 0.0], [1.0, 1.0]]), np.array([1.0, np.nan]), 1, "A6", "Rue")],
+                               corrected=True)
+        path = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"roadz_test_{os.getpid()}.npz")
+        try:
+            ln.save(path)
+            back = roadz.Lines.load(path)
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+        self.assertEqual(len(back), 1)
+        self.assertTrue(back.corrected)
+        self.assertEqual((str(back.ref[0]), str(back.name[0]), int(back.level[0])), ("A6", "Rue", 1))
+        self.assertTrue(np.isnan(back.z[1]))
+
+
+class NameTest(unittest.TestCase):
+    def test_refs(self):
+        self.assertEqual(roadz.refs_of("A 75"), {"a75"})
+        self.assertEqual(roadz.refs_of("E18"), {"e18"})
+
+    def test_name_ok(self):
+        self.assertTrue(roadz.name_ok("", "Rue de Rivoli", ""))
+        self.assertTrue(roadz.name_ok("Rue de Rivoli", "rue de rivoli", ""))
+        self.assertTrue(roadz.name_ok("Boulevard Périphérique", "Bd Peripherique Interieur", ""))
+        self.assertFalse(roadz.name_ok("Rue de Rivoli", "Avenue Kleber", ""), "two names, no word shared")
+        self.assertTrue(roadz.name_ok("Autoroute du Soleil", "", "A6"), "a number alone contradicts no name")
+        self.assertFalse(roadz.name_ok("A 75", "", "A6"), "two road numbers that differ")
+        self.assertTrue(roadz.name_ok("E 18", "", "E18"))
+
+
+class DatumTest(unittest.TestCase):
+    def test_offset(self):
+        dem = np.linspace(50, 80, 200)
+        got = roadz.datum_fit(dem + 1.3 + np.sin(np.arange(200)) * 0.1, dem)
+        self.assertEqual(got[0], 1.0)
+        self.assertAlmostEqual(got[1], 1.3, places=1)
+
+    def test_feet(self):
+        dem = np.linspace(50, 80, 200)
+        got = roadz.datum_fit(dem / 0.3048, dem)
+        self.assertEqual(got[0], 0.3048)
+        self.assertAlmostEqual(got[1], 0.0, places=3)
+
+    def test_spread_refused(self):
+        rng = np.random.default_rng(1)
+        self.assertIsNone(roadz.datum_fit(rng.uniform(0, 100, 300), np.full(300, 50.0)))
+        self.assertIsNone(roadz.datum_fit(np.ones(5), np.ones(5)), "too few points")
+
+
+@unittest.skipUnless(NATIVE, "earthfast roadz kernels")
+class KernelTest(unittest.TestCase):
+    def test_match_parallel_and_direction(self):
+        # a source line 3 m north of the map road, rising 1 m in 100 m; a crossing line (north-south) at 2 m is not it
+        q = np.c_[np.arange(0.0, 101.0, 10.0), np.zeros(11)]
+        qdir = np.tile([1.0, 0.0], (11, 1))
+        seg = np.array([[0.0, 3.0, 100.0, 3.0], [50.0, -50.0, 50.0, 50.0]])
+        segz = np.array([[10.0, 11.0], [99.0, 99.0]])
+        z, d = ef.roadz_match(q, qdir, seg, segz, np.array([1, 1], np.uint8), 6.0, 0.85)
+        np.testing.assert_allclose(z, 10.0 + q[:, 0] / 100.0, atol=1e-9)
+        np.testing.assert_allclose(d, 3.0, atol=1e-9)
+        z2, _ = ef.roadz_match(q, qdir, seg, segz, np.array([0, 1], np.uint8), 6.0, 0.85)
+        self.assertTrue(np.isnan(z2).all(), "the parallel one not allowed (level / name), the crossing one too steep")
+        z3, _ = ef.roadz_match(q, qdir, seg, segz, np.array([1, 1], np.uint8), 2.0, 0.85)
+        self.assertTrue(np.isnan(z3).all(), "out of reach")
+
+    def test_clean_spike_and_gap(self):
+        s = np.arange(0.0, 200.0, 4.0)
+        z = 20.0 + 0.03 * s
+        z[10] += 6.0                     # a spike (a sign gantry)
+        z[20:24] = np.nan                # 16 m of nothing
+        out = ef.profile_clean(s, z, 0.12, 1.5, 20.0, 30.0, 0.0)
+        np.testing.assert_allclose(out, 20.0 + 0.03 * s, atol=1e-9)
+
+    def test_clean_long_gap_stays(self):
+        s = np.arange(0.0, 200.0, 4.0)
+        z = np.full(len(s), 5.0)
+        z[10:30] = np.nan
+        out = ef.profile_clean(s, z, 0.12, 1.5, 20.0, 30.0, 0.0)
+        self.assertTrue(np.isnan(out[10:30]).all())
+
+    def test_deck_from_points(self):
+        # a 120 m deck: ground at 0 (seen beside / under it), the road surface rising 0 -> 3.5 m -> 0 over its length
+        # (9 % at most), cars 1.5 m over it at a few stations, an upper deck 9 m over it across 15 m of it
+        rng = np.random.default_rng(3)
+        line = np.c_[np.linspace(0, 120, 31), np.zeros(31)]
+        x = rng.uniform(0, 120, 12000)
+        y = rng.uniform(-6, 6, 12000)
+        deck = 3.5 * np.sin(np.pi * x / 120.0)
+        z = deck + rng.normal(0, 0.03, len(x))
+        cls = np.full(len(x), 1, np.uint8)
+        car = (np.abs(y) < 1.5) & ((x % 30) < 4)
+        z[car] += 1.5
+        up = (x > 50) & (x < 65) & (rng.uniform(0, 1, len(x)) < 0.6)
+        z[up] = deck[up] + 9.0
+        cls[up] = 17
+        gx = rng.uniform(0, 120, 3000)
+        g = np.c_[gx, rng.uniform(-6, 6, 3000), np.zeros(3000)]
+        pts = np.ascontiguousarray(np.vstack([np.c_[x, y, z], g]))
+        cl = np.concatenate([cls, np.full(3000, 2, np.uint8)])
+        s, zz, cnt = ef.deck_lidar(line, pts, cl, 6.0, 4.0, 0.10, 3, 24.0, 0.0)
+        want = 3.5 * np.sin(np.pi * s / 120.0)
+        ok = np.isfinite(zz)
+        self.assertGreater(ok.mean(), 0.8)
+        mid = ok & (s > 15) & (s < 105)
+        self.assertLess(float(np.abs(zz[mid] - want[mid]).max()), 0.25, "the deck, not the cars, the upper deck "
+                                                                         "or the ground under it")
+
+    def test_blend(self):
+        s = np.arange(0.0, 101.0, 1.0)
+        z = np.full(len(s), 8.0)
+        out = ef.deck_blend(s, z, 7.0, float("nan"), 0.04, 10.0, 0.5)
+        self.assertAlmostEqual(out[0], 7.0)
+        self.assertAlmostEqual(out[-1], 8.0)
+        self.assertLessEqual(float(np.abs(np.diff(np.diff(out))).max()), 0.04 * 1.0 + 1e-9)
+
+    def test_las_plain(self):
+        # a LAS 1.2 point format 0 file of two points (no compression)
+        hdr = bytearray(227)
+        hdr[0:4] = b"LASF"
+        hdr[24], hdr[25] = 1, 2
+        struct.pack_into("<H", hdr, 94, 227)
+        struct.pack_into("<I", hdr, 96, 227)
+        struct.pack_into("<I", hdr, 100, 0)
+        hdr[104] = 0
+        struct.pack_into("<H", hdr, 105, 20)
+        struct.pack_into("<I", hdr, 107, 2)
+        struct.pack_into("<3d", hdr, 131, 0.01, 0.01, 0.01)
+        struct.pack_into("<3d", hdr, 155, 1000.0, 2000.0, 0.0)
+        pts = b""
+        for (x, y, z, c) in ((100, 200, 550, 2), (5000, 200, 900, 17)):
+            rec = bytearray(20)
+            struct.pack_into("<3i", rec, 0, x, y, z)
+            rec[15] = c
+            pts += bytes(rec)
+        xyz, cls = ef.las_decode(bytes(hdr) + pts, [-1e9, -1e9, 1e9, 1e9])
+        np.testing.assert_allclose(xyz, [[1001.0, 2002.0, 5.5], [1050.0, 2002.0, 9.0]])
+        self.assertEqual(list(cls), [2, 17])
+        xyz2, _ = ef.las_decode(bytes(hdr) + pts, [0.0, 0.0, 1010.0, 1e9])
+        self.assertEqual(len(xyz2), 1, "the box")
+        with self.assertRaises(ValueError):
+            ef.las_decode(b"nope" * 100, [0, 0, 1, 1])
+
+
+
+def las_bytes(points):
+    """A LAS 1.2 point format 0 file (no compression) of points [(x, y, z, class)] in 0.01 units at (1000, 2000, 0)."""
+    hdr = bytearray(227)
+    hdr[0:4] = b"LASF"
+    hdr[24], hdr[25] = 1, 2
+    struct.pack_into("<H", hdr, 94, 227)
+    struct.pack_into("<I", hdr, 96, 227)
+    struct.pack_into("<I", hdr, 100, 0)
+    hdr[104] = 0
+    struct.pack_into("<H", hdr, 105, 20)
+    struct.pack_into("<I", hdr, 107, len(points))
+    struct.pack_into("<3d", hdr, 131, 0.01, 0.01, 0.01)
+    struct.pack_into("<3d", hdr, 155, 1000.0, 2000.0, 0.0)
+    out = bytes(hdr)
+    for (x, y, z, c) in points:
+        rec = bytearray(20)
+        struct.pack_into("<3i", rec, 0, x, y, z)
+        rec[15] = c
+        out += bytes(rec)
+    return out
+
+
+class PartsTest(unittest.TestCase):
+    """A cell's lidar read keeps each node's points on disk as they come (2026-11-06): a read dropped this run goes on
+    from there next time instead of downloading every node again (a busy cell was dropped at every visit)."""
+
+    def test_a_second_read_takes_the_nodes_from_disk(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            asked = []
+
+            def provider():
+                rz = roadz.RoadZ(d, None)
+                rz._fetch = lambda url, headers=None, lane=None: asked.append(url) or las_bytes(
+                    [(100, 200, 550, 2), (5000, 200, 900, 17)])
+                return rz
+            key = mapcells.CellKey(14, 4683, 6266)
+            boxes = [(1000.0, 2000.0, 1060.0, 2010.0)]
+            a = provider()._read("USGS_X", ["0-0-0-0", "1-0-0-0"], boxes, key)
+            self.assertEqual(len(asked), 2)
+            b = provider()._read("USGS_X", ["0-0-0-0", "1-0-0-0"], boxes, key)
+            self.assertEqual(len(asked), 2, "the second read from disk")
+            np.testing.assert_array_equal(a[0], b[0])
+            np.testing.assert_array_equal(a[1], b[1])
+            provider()._read("USGS_X", ["0-0-0-0"], [(1000.0, 2000.0, 1070.0, 2010.0)], key)
+            self.assertEqual(len(asked), 3, "other boxes (another bridge, a changed map) read their own")
+
+    def test_a_node_two_cells_share_is_read_once(self):
+        """Neighbouring cells' boxes share EPT nodes: a node this process read for one cell is not downloaded again for
+        the next (RoadZ._node_bytes), each cell's points its own boxes'."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            asked = []
+            rz = roadz.RoadZ(d, None)
+            rz._fetch = lambda url, headers=None, lane=None: asked.append(url) or las_bytes(
+                [(100, 200, 550, 2), (5000, 200, 900, 17)])
+            a = rz._read("USGS_X", ["0-0-0-0", "1-0-0-0"], [(1000.0, 2000.0, 1010.0, 2010.0)],
+                         mapcells.CellKey(14, 4683, 6266))
+            b = rz._read("USGS_X", ["1-0-0-0", "2-0-0-0"], [(1000.0, 2000.0, 1070.0, 2010.0)],
+                         mapcells.CellKey(14, 4684, 6266))
+            self.assertEqual(sorted(u.rsplit("/", 1)[-1] for u in asked), ["0-0-0-0.laz", "1-0-0-0.laz", "2-0-0-0.laz"])
+            self.assertEqual(rz.stats.get("shared"), 1)
+            self.assertEqual(len(a[0]), 2)              # (one point a node in the first cell's box)
+            self.assertEqual(len(b[0]), 4)              # (both in the second's)
+
+    def _parts(self, d, key, name="USGS_X"):
+        import glob
+        return sorted(glob.glob(os.path.join(d, "roadz", f"v{roadz.VERSION}", "eptparts", str(key).replace("/", "_"),
+                                             name, "*", "*.npz")))
+
+    def test_a_node_another_process_reads_is_waited_for(self):
+        """The main process's warm and a block process read the same cell: a node the other one has claimed (its
+        lock file) is not downloaded again; its part file is taken once written."""
+        import shutil
+        import subprocess
+        import tempfile
+        import threading
+        with tempfile.TemporaryDirectory() as d:
+            asked = []
+            rz = roadz.RoadZ(d, None)
+            rz._fetch = lambda url, headers=None, lane=None: asked.append(url) or las_bytes(
+                [(100, 200, 550, 2), (5000, 200, 900, 17)])
+            key = mapcells.CellKey(14, 4683, 6266)
+            boxes = [(1000.0, 2000.0, 1060.0, 2010.0)]
+            nodes = ["0-0-0-0", "1-0-0-0"]
+            a = rz._read("USGS_X", nodes, boxes, key)
+            p0, p1 = self._parts(d, key)
+            keep = os.path.join(d, "keep.npz")
+            shutil.copy(p1, keep)
+            os.remove(p0)
+            os.remove(p1)
+            with open(p1 + ".lock", "w") as fh:         # (held by a live process: this one's parent)
+                fh.write(f"1 0 {os.getppid()}")
+
+            def other():
+                time.sleep(0.3)
+                shutil.copy(keep, p1 + ".tmp")
+                os.replace(p1 + ".tmp", p1)
+                os.remove(p1 + ".lock")
+            t = threading.Thread(target=other)
+            t.start()
+            import xproc
+            xproc._cancel_proc[0] = lambda: True    # (a job's cancel check: not the read's business)
+            rz._raw.clear()                         # (as another process: nothing of this one's memory)
+            try:
+                b = rz._read("USGS_X", nodes, boxes, key)
+            finally:
+                xproc._cancel_proc[0] = None
+            t.join()
+            self.assertEqual(len(asked), 3, "node 1 waited for, not read again")
+            np.testing.assert_array_equal(a[0], b[0])
+            np.testing.assert_array_equal(a[1], b[1])
+            # a holder that died: its claim taken over at once
+            os.remove(p1)
+            dead = subprocess.Popen([sys.executable, "-c", "pass"])
+            dead.wait()
+            with open(p1 + ".lock", "w") as fh:
+                fh.write(f"1 0 {dead.pid}")
+            t0 = time.monotonic()
+            rz._raw.clear()
+            c = rz._read("USGS_X", nodes, boxes, key)
+            self.assertLess(time.monotonic() - t0, 5.0)
+            self.assertEqual(len(asked), 4)
+            np.testing.assert_array_equal(a[0], c[0])
+            self.assertFalse(os.path.exists(p1 + ".lock"))
+
+    def test_a_cell_another_process_built_is_taken_from_disk(self):
+        """Another process wrote the cell's file (and removed its parts) while this one read its nodes: the cell is
+        read from that file, not built again."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            rz = roadz.RoadZ(d, None)
+            key = mapcells.CellKey(14, 4683, 6266)
+            final = rz._path("lidar", key)
+            os.makedirs(os.path.dirname(final), exist_ok=True)
+            done = roadz.Lines.build([], corrected=True)
+
+            def fetch(url, headers=None, lane=None):
+                with open(final + ".gaps.json", "w") as fh:
+                    fh.write("[]")
+                done.save(final)                        # (the other process's, mid-read)
+                return las_bytes([(100, 200, 550, 2)])
+            rz._fetch = fetch
+            rz._lidar = lambda k: rz._read("USGS_X", ["0-0-0-0", "1-0-0-0"], [(1000.0, 2000.0, 1060.0, 2010.0)], k)
+            roadz.LIDAR_FETCH_THREADS, old = 1, roadz.LIDAR_FETCH_THREADS
+            try:
+                got = rz.lines("lidar", key)
+            finally:
+                roadz.LIDAR_FETCH_THREADS = old
+            self.assertEqual(len(got), 0)
+            self.assertEqual(got.gaps, [])
+
+class FakeDem:
+    def __init__(self, z):
+        self.z = z
+
+    def sample(self, la, lo, zoom):
+        return np.full(np.shape(la), self.z, np.float64)
+
+
+class FakeMDem:
+    def __init__(self, z):
+        self.dem = FakeDem(z)
+
+
+def provider_with(lines, src="ign", dem=FLAT):
+    """A RoadZ whose cells all hold `lines` (no network) on a flat DEM at `dem`."""
+    rz = roadz.RoadZ(None, object(), FakeMDem(dem))
+    rz.enabled = True
+    rz.lines = lambda s, key: lines if s == src else roadz.Lines.build([])
+    return rz
+
+
+@unittest.skipUnless(NATIVE, "earthfast roadz kernels")
+class ObservedTest(unittest.TestCase):
+    def setUp(self):
+        self.old = roadz.sources_at
+        roadz.sources_at = lambda lat, lon, lidar=None: ["ign"]
+
+    def tearDown(self):
+        roadz.sources_at = self.old
+
+    def src_line(self, xs, ys, zs, level, ref="", name=""):
+        la, lo, _ = FRAME.enu_to_geodetic(np.asarray(xs, float), np.asarray(ys, float), 0.0)
+        return (np.c_[lo, la], np.asarray(zs, float), level, ref, name)
+
+    def test_relative_to_source_ground(self):
+        # the source's datum is 1.5 m over ours (its ground roads say so): the deck comes out 1.5 m lower than its Z
+        bridge = self.src_line(np.linspace(-35, 35, 15), np.full(15, 2.0), np.full(15, FLAT + 1.5 + 6.0), 1)
+        ground = self.src_line(np.linspace(-200, -35, 20), np.full(20, 2.0), np.full(20, FLAT + 1.5), 0)
+        rz = provider_with(roadz.Lines.build([bridge, ground]))
+        xy = np.c_[np.linspace(-35, 35, 36), np.zeros(36)]
+        info = {}
+        z = rz.observed(FRAME, xy, 4.0, 1, "", info)
+        self.assertIsNotNone(z)
+        np.testing.assert_allclose(z, FLAT + 6.0, atol=1e-6)
+        self.assertAlmostEqual(info["offset"], 1.5)
+        self.assertIsNone(rz.observed(FRAME, xy, 4.0, -1), "no tunnel there")
+
+    def test_level_must_agree(self):
+        ground = self.src_line(np.linspace(-200, 200, 40), np.zeros(40), np.full(40, FLAT), 0)
+        rz = provider_with(roadz.Lines.build([ground]))
+        xy = np.c_[np.linspace(-35, 35, 36), np.zeros(36)]
+        self.assertIsNone(rz.observed(FRAME, xy, 4.0, 1), "a ground road gives no deck height")
+        self.assertIsNotNone(rz.observed(FRAME, xy, 4.0, 0))
+
+    def test_deck_of_another_tier_crossing_overhead(self):
+        """A deck one tier up crosses this sloping bridge at a shallow angle, and hides its own line's heights under
+        it: the stations nearest the upper line do not take its heights (a 10 m tent on the lower deck, whose own
+        heights the grade rule dropped for it)."""
+        x = np.linspace(-300, 300, 121)
+        own = self.src_line(x, np.full(121, 2.0), np.where(np.abs(x) < 30, np.nan, FLAT + 12.0 - 0.02 * x), 1)
+        upper = self.src_line(np.linspace(-150, 150, 31), np.linspace(-40, 40, 31), np.full(31, FLAT + 22.0), 2)
+        ground = self.src_line(np.linspace(-500, -300, 20), np.full(20, 2.0), np.full(20, FLAT), 0)
+        rz = provider_with(roadz.Lines.build([own, upper, ground]))
+        q = np.linspace(-300, 300, 201)
+        z = rz.observed(FRAME, np.c_[q, np.zeros(201)], 4.0, 1)
+        self.assertIsNotNone(z)
+        ok = np.isfinite(z)
+        np.testing.assert_allclose(z[ok], FLAT + 12.0 - 0.02 * q[ok], atol=0.05)
+        self.assertGreater(ok.mean(), 0.85, "the deck's own heights either side of the crossing stay")
+
+    def test_road_that_changes_tier_keeps_both(self):
+        """A road up to a higher tier and down again over 150 m is its own: nothing is dropped."""
+        xs = (np.linspace(-300, -75, 46), np.linspace(-75, 75, 31), np.linspace(75, 300, 46))
+        zs = (np.linspace(FLAT + 6.0, FLAT + 12.0, 46), np.full(31, FLAT + 12.0), np.linspace(FLAT + 12.0, FLAT + 6.0, 46))
+        decks = [self.src_line(x, np.full(len(x), 2.0), z, t) for x, z, t in zip(xs, zs, (1, 2, 1))]
+        ground = self.src_line(np.linspace(-500, -300, 20), np.full(20, 2.0), np.full(20, FLAT), 0)
+        rz = provider_with(roadz.Lines.build(decks + [ground]))
+        q = np.linspace(-300, 300, 201)
+        z = rz.observed(FRAME, np.c_[q, np.zeros(201)], 4.0, 1)
+        np.testing.assert_allclose(z, np.interp(q, np.concatenate(xs), np.concatenate(zs)), atol=0.05)
+
+    def test_off(self):
+        bridge = self.src_line(np.linspace(-35, 35, 15), np.zeros(15), np.full(15, 20.0), 1)
+        rz = provider_with(roadz.Lines.build([bridge]))
+        rz.enabled = False
+        self.assertIsNone(rz.observed(FRAME, np.c_[np.linspace(-35, 35, 36), np.zeros(36)], 4.0, 1))
+
+
+class StubProvider:
+    """observed() from a function of the part's arc length (geodetic heights), for the override tests."""
+
+    def __init__(self, fn, level=1):
+        self.fn, self.level, self.enabled, self.calls = fn, level, True, 0
+
+    def observed(self, frame, xy, half, level, name="", info=None):
+        self.calls += 1
+        if level != self.level or self.fn is None:
+            return None
+        xy = np.asarray(xy, np.float64)[:, :2]
+        s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+        return self.fn(xy, s)
+
+
+def solve_overpass():
+    f = overpass()
+    bp = roads.BridgeProfiles(FRAME, lambda key: f, flat_elev)
+    parts = bp.parts([f], (-100, -100, 100, 100))
+    _fid, _spec, xy, z, _lon = parts[0]
+    return np.asarray(xy, np.float64)[:, :2], np.asarray(z, np.float64)
+
+
+@unittest.skipUnless(NATIVE, "earthfast roadz kernels")
+class BridgeOverrideTest(unittest.TestCase):
+    def setUp(self):
+        self.old = roadz.PROVIDER
+
+    def tearDown(self):
+        roadz.PROVIDER = self.old
+
+    def test_fallback_is_the_inference(self):
+        roadz.PROVIDER = None
+        xy0, z0 = solve_overpass()
+        roadz.PROVIDER = StubProvider(None)
+        xy1, z1 = solve_overpass()
+        np.testing.assert_allclose(z1, z0, atol=1e-12)
+
+    def test_measured_deck_used(self):
+        roadz.PROVIDER = None
+        xy, z0 = solve_overpass()
+        s0 = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+        bump = 0.6 * np.sin(np.pi * s0 / s0[-1])
+
+        def fn(xy_, s):
+            zu = np.interp(s, s0, z0 + bump)
+            la, lo, h = FRAME.enu_to_geodetic(xy_[:, 0], xy_[:, 1], zu)
+            return np.asarray(h, np.float64)
+        roadz.PROVIDER = StubProvider(fn)
+        _xy, z1 = solve_overpass()
+        np.testing.assert_allclose(z1, z0 + bump, atol=0.02)
+        self.assertAlmostEqual(z1[0], z0[0], places=6, msg="the abutments keep the graded road's height")
+        self.assertAlmostEqual(z1[-1], z0[-1], places=6)
+
+    def test_wild_measurement_refused(self):
+        roadz.PROVIDER = None
+        xy, z0 = solve_overpass()
+
+        def fn(xy_, s):
+            return np.where((s > 30) & (s < 34), FLAT + 30.0, FLAT + 6.0)
+        roadz.PROVIDER = StubProvider(fn)
+        _xy, z1 = solve_overpass()
+        np.testing.assert_allclose(z1, z0, atol=1e-9, err_msg="steeper than OBS_MAX_GRADE: the solve stays")
+
+    def test_lower_deck_under_a_higher_one_keeps_its_solve(self):
+        # the lidar sees the upper deck's top: a lower deck under it took that height and lay inside it (the Bay
+        # Bridge's two decks both 61.9 m, solved 52.3 / 60.7, Discord 2026-11-10); a deck beside it keeps its measurement
+        import types
+        bp = roads.BridgeProfiles(FRAME, lambda key: None, flat_elev)
+        line = np.c_[np.linspace(0.0, 200.0, 51), np.zeros(51)]
+        spec = types.SimpleNamespace(width=18.0)
+        lower, upper, beside = ("lo", 0), ("up", 0), ("bs", 0)
+        pool = {lower: (spec, line, 0.0, 1.0, 51, ""), upper: (spec, line + [0.4, 0.0], 0.0, 2.0, 51, ""),
+                beside: (spec, line + [0.0, 40.0], 0.0, 1.0, 51, "")}
+        z = np.full(51, FLAT + 4.0)
+        roadz.PROVIDER = StubProvider(lambda xy_, s: np.full(len(xy_), FLAT + 6.0))
+        out = bp._observed([lower], pool, [line], [z])
+        np.testing.assert_allclose(out[0], z, atol=1e-9, err_msg="under the upper deck: the solve")
+        out2 = bp._observed([beside], pool, [line + [0.0, 40.0]], [z])
+        self.assertGreater(float(np.median(out2[0])), FLAT + 5.0, "a deck beside it: measured (off its solve, FLAT + 4)")
+
+    def test_short_deck_spike_refused(self):
+        # a deck of three points (4.4 m: a culvert's bridge) measured 5 m over its ends in the middle keeps the solve:
+        # the grade check skipped parts this short, and the spike stood across the road as a tent (GitHub #1066)
+        import types
+        bp = roads.BridgeProfiles(FRAME, lambda key: None, flat_elev)
+        k = ("culvert", 0)
+        pool = {k: (types.SimpleNamespace(width=9.0), None, 0.0, 1.0, 3, "")}
+        line = np.c_[[0.0, 2.2, 4.4], [0.0, 0.0, 0.0]]
+        z = np.array([FLAT, FLAT - 0.2, FLAT - 0.4])
+        roadz.PROVIDER = StubProvider(lambda xy_, s: FLAT + np.where(np.abs(s - 2.2) < 0.1, 5.2, 0.0) - 0.2 * s / 2.2)
+        out = bp._observed([k], pool, [line], [z])
+        np.testing.assert_allclose(out[0], z, atol=0.05)
+
+
+@unittest.skipUnless(NATIVE, "earthfast roadz kernels")
+class GradingOverrideTest(unittest.TestCase):
+    def setUp(self):
+        self.old = roadz.PROVIDER
+
+    def tearDown(self):
+        roadz.PROVIDER = self.old
+
+    def test_plan_takes_measured_heights(self):
+        line = np.c_[np.linspace(0, 400, 101), np.zeros(101)]
+        la, lo, _ = FRAME.enu_to_geodetic(line[:, 0], line[:, 1], 0.0)
+        spec = roads.road_specs(overpass())[1]       # (a motorway)
+        p0 = grading.plan_roads(FRAME, [(np.c_[lo, la], spec)], flat_elev, cuts=False)[0]
+        p1 = grading.plan_roads(FRAME, [(np.c_[lo, la], spec)], flat_elev, cuts=False,
+                                obs=lambda xy, sp: np.full(len(xy), FLAT + 2.0))[0]
+        np.testing.assert_allclose(p0.z, FLAT, atol=1e-9)
+        self.assertGreater(float(np.median(p1.z)), FLAT + 1.9, "the measured profile, not the DEM's")
+        p2 = grading.plan_roads(FRAME, [(np.c_[lo, la], spec)], flat_elev, cuts=False, obs=lambda xy, sp: None)[0]
+        np.testing.assert_allclose(p2.z, p0.z, atol=1e-12, err_msg="nothing measured: the DEM")
+
+    def test_ground_override_only_on_coarse_elevation(self):
+        g = grading._Planner(FRAME, FakeMD(overpass()), flat_elev)
+        roadz.PROVIDER = StubProvider(lambda xy, s: np.full(len(xy), 99.0), level=0)
+        g.dem = type("D", (), {"coarse_at": staticmethod(lambda la, lo: False)})()
+        self.assertIsNone(g._obs(mapcells.cell_of(float(FRAME.lat0), float(FRAME.lon0))))
+        g.dem = type("D", (), {"coarse_at": staticmethod(lambda la, lo: True)})()
+        self.assertIsNotNone(g._obs(mapcells.cell_of(float(FRAME.lat0), float(FRAME.lon0))))
+
+    def test_measured_abutment_not_raised(self):
+        # the overpass's abutments would be raised for the motorway's clearance (test_approaches); a measured deck
+        # whose ends sit on the ground says they are not
+        f = overpass()
+        g = grading._Planner(FRAME, FakeMD(f), flat_elev)
+        line = np.c_[np.linspace(-35, 35, 36), np.zeros(36)]
+        roadz.PROVIDER = None
+        self.assertIsNotNone(g._end_lift(line[0]), "the inference raises it")
+        g2 = grading._Planner(FRAME, FakeMD(f), flat_elev)
+        roadz.PROVIDER = StubProvider(lambda xy, s: FLAT + 7.0 * np.sin(np.pi * s / s[-1]))
+        self.assertIsNone(g2._end_lift(line[0]), "measured at the ground there: no ramp")
+        g3 = grading._Planner(FRAME, FakeMD(f), flat_elev)
+        roadz.PROVIDER = StubProvider(lambda xy, s: np.full(len(xy), FLAT + 2.0))
+        got = g3._end_lift(line[0])
+        self.assertAlmostEqual(got[0], 2.0, places=6, msg="measured 2 m up: raised 2 m")
+
+
+@unittest.skipUnless(NATIVE, "earthfast roadz kernels")
+class TunnelOverrideTest(unittest.TestCase):
+    def test_floor_only_deeper_and_inside(self):
+        tp = object.__new__(roads.TunnelProfiles)
+        tp.frame = FRAME
+        xy = np.c_[np.arange(0.0, 201.0, 4.0), np.zeros(51)]
+        s = xy[:, 0].copy()
+        floor = np.full(len(s), 10.0)
+        secs = [(0, 5, 0), (5, 45, 2), (45, 50, 0)]
+        spec = roads.road_specs(overpass())[0]
+        pool = {("t", 0): (spec, xy, 0.0, -1.0, 51, "")}
+        old = roadz.PROVIDER
+        try:
+            roadz.PROVIDER = StubProvider(lambda xy_, s_: np.full(len(xy_), 4.0), level=-1)
+            out = tp._observed_floor(("t", 0), pool, xy, s, floor, secs)
+            self.assertAlmostEqual(out[5], 10.0, msg="the portal keeps the hull's floor")
+            self.assertAlmostEqual(out[0], 10.0, msg="the open section is left")
+            self.assertLess(float(out[25]), 4.2, "deeper in the middle, as measured")
+            roadz.PROVIDER = StubProvider(lambda xy_, s_: np.full(len(xy_), 30.0), level=-1)
+            out = tp._observed_floor(("t", 0), pool, xy, s, floor, secs)
+            np.testing.assert_allclose(out, floor, err_msg="never over the ground's hull")
+        finally:
+            roadz.PROVIDER = old
+
+
+
+@unittest.skipUnless(NATIVE, "earthfast roadz kernels")
+class MeasuredRampFromPlanTest(unittest.TestCase):
+    """The approach ramp to a measured deck end rises from the road's plan, not from the ground under the end point
+    (Charles Street over I-83 in Baltimore: the deck's end over the cut's slope, 2.7 m lower than the street, the
+    street raised 2.2 m over its plan to the deck's measured height counted from the slope, a 2.5 m step there)."""
+
+    def setUp(self):
+        self.old = roadz.PROVIDER
+
+    def tearDown(self):
+        roadz.PROVIDER = self.old
+
+    def lifted(self, measured):
+        f = overpass()
+        spec = roads.road_specs(f)[0]
+        xy = np.c_[np.linspace(-400, -35, 120), np.zeros(120)]
+        la, lo, _ = FRAME.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
+        plan = grading.plan_roads(FRAME, [(np.c_[lo, la], spec)], flat_elev, cuts=False)[0]
+
+        def cut_elev(la_, lo_):         # (the ground falls 3 m into a cut right under the deck's end)
+            e, n, _ = FRAME.geodetic_to_enu(np.asarray(la_, np.float64), np.asarray(lo_, np.float64), 0.0)
+            return np.where(np.abs(np.asarray(e) + 35.0) < 1.0, FLAT - 3.0, FLAT)
+        g = grading._Planner(FRAME, FakeMD(f), cut_elev)
+        roadz.PROVIDER = StubProvider(lambda xy_, s: np.full(len(xy_), measured))
+        plans = [("cross", plan)]
+        g._lift_approaches(mapcells.cell_of(float(FRAME.lat0), float(FRAME.lon0)), plans, [spec])
+        return float(plans[0][1].z[-1])
+
+    def test_ramp_from_the_plan(self):
+        self.assertLess(abs(self.lifted(FLAT + 0.2) - FLAT), 0.05, "measured at the street's height: not raised")
+        self.assertAlmostEqual(self.lifted(FLAT + 2.0), FLAT + 2.0, delta=0.05, msg="raised to the deck's end")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class SlowGapsTest(unittest.TestCase):
+    """gap_answers: after one cell's lidar missed LIDAR_GAPS_WAIT_S, the next cells wait LIDAR_GAPS_SLOW_WAIT_S at most
+    (each call waited the full time anew: 43 s of one cold Denver road tile)."""
+
+    def test_second_call_waits_less(self):
+        import tempfile
+        import time
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.object(roadz, "LIDAR_GAPS_WAIT_S", 0.6), \
+                mock.patch.object(roadz, "LIDAR_GAPS_SLOW_WAIT_S", 0.1), \
+                mock.patch.object(roadz, "sources_at", lambda la, lo, lidar=None: ["lidar"]):
+            rz = roadz.RoadZ(d, object())
+            rz.enabled = rz.lidar = True
+            rz.lines = lambda src, key: time.sleep(3)       # (a slow lidar read: never in time)
+            t0 = time.monotonic()
+            first = rz.gap_answers([(14, 1, 1)])
+            t1 = time.monotonic()
+            second = rz.gap_answers([(14, 2, 2)])
+            t2 = time.monotonic()
+        self.assertEqual(list(first.values()), [None])
+        self.assertEqual(list(second.values()), [None])
+        self.assertGreaterEqual(t1 - t0, 0.55)
+        self.assertLess(t2 - t1, 0.4, "the second cell waited the full time again")
+
+
+class PrefetchWantsTest(unittest.TestCase):
+    """The server's lidar prefetch (RoadZ.prefetch) and the cells planning asked for: read, and kept used, so a place
+    visited again plans on its lidar and is kept (the terrain blocks, the plans, the road tiles: revisit.py)."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        from unittest import mock
+        self.mock = mock
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        p = mock.patch.dict(os.environ, {roadz.SESSION_ENV: f"w{time.monotonic_ns()}"})
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(roadz, "sources_at", lambda la, lo, lidar=None: ["lidar"])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def provider(self):
+        rz = roadz.RoadZ(self.tmp, object())
+        rz.enabled = rz.lidar = True
+        return rz
+
+    def wait_idle(self, rz, n, timeout=5.0):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            st = rz._pf()
+            with st["cv"]:
+                if len(st["done"]) + len(st["failed"]) >= n and not st["busy"]:
+                    return
+            time.sleep(0.02)
+        self.fail("the prefetch did not finish")
+
+    def test_cells_planning_asked_for_read_past_the_far_limit(self):
+        """A cell a planning process asked for (a want file) is read up to PREFETCH_WANT_FAR_M from the player, not
+        dropped at PREFETCH_FAR_M with the cells queued round the player: planning near the player asks for the deck
+        ends' cells 8-16 km out, and those were never read, so the place was never kept (Fells Point, a 16 GB Windows
+        PC with no late pool, 2026-11-14). A want past PREFETCH_WANT_FAR_M still goes (a teleport far away)."""
+        rz = self.provider()
+        read = []
+        rz.lines = lambda src, key: read.append((key.x, key.y)) or roadz.Lines.build([])
+        mid = (roadz.PREFETCH_FAR_M + roadz.PREFETCH_WANT_FAR_M) / 2
+        dist = {1: 10.0, 2: mid, 3: mid, 4: roadz.PREFETCH_WANT_FAR_M * 2}
+        with self.mock.patch.object(roadz, "PREFETCH_CELLS", 1), self.mock.patch.object(roadz, "PREFETCH_POLL_S", 0.05):
+            rz._want("lidar", mapcells.CellKey(14, 2, 0))     # (asked by planning, past PREFETCH_FAR_M)
+            rz._want("lidar", mapcells.CellKey(14, 4, 0))     # (asked by planning, past PREFETCH_WANT_FAR_M)
+            rz.prefetch([mapcells.CellKey(14, 1, 0), mapcells.CellKey(14, 3, 0)], where=lambda k: dist[k.x])
+            self.wait_idle(rz, 2)
+            time.sleep(0.2)
+        self.assertEqual(sorted(read), [(1, 0), (2, 0)])
+        self.assertEqual(rz.prefetch_state(mapcells.CellKey(14, 2, 0)), "done", "the cell planning asked for")
+        self.assertIsNone(rz.prefetch_state(mapcells.CellKey(14, 3, 0)), "past PREFETCH_FAR_M, not asked: dropped")
+        self.assertIsNone(rz.prefetch_state(mapcells.CellKey(14, 4, 0)), "past PREFETCH_WANT_FAR_M: dropped")
+
+    def test_a_wanted_cell_whose_read_failed_is_tried_again(self):
+        """A wanted cell keeps its far limit when queued again after a failed read (no planning process asks twice:
+        its decision for the run is made)."""
+        rz = self.provider()
+        tries = []
+
+        def lines(src, key):
+            tries.append(key.x)
+            return None if tries.count(2) == 1 and key.x == 2 else roadz.Lines.build([])
+        rz.lines = lines
+        mid = (roadz.PREFETCH_FAR_M + roadz.PREFETCH_WANT_FAR_M) / 2
+        with self.mock.patch.object(roadz, "PREFETCH_CELLS", 1), self.mock.patch.object(roadz, "PREFETCH_POLL_S", 0.05), \
+                self.mock.patch.object(roadz, "PREFETCH_RETRY_S", 0.0):
+            rz._want("lidar", mapcells.CellKey(14, 2, 0))
+            rz.prefetch([mapcells.CellKey(14, 1, 0)], where=lambda k: 10.0 if k.x == 1 else mid)
+            end = time.monotonic() + 5.0
+            while time.monotonic() < end and rz.prefetch_state(mapcells.CellKey(14, 2, 0)) != "done":
+                time.sleep(0.02)
+        self.assertEqual(rz.prefetch_state(mapcells.CellKey(14, 2, 0)), "done")
+        self.assertEqual(tries.count(2), 2, "read again after the failed read")
+
+    def _failing_want(self, fail):
+        """A wanted cell 8-24 km out whose every read fails (fail(): what the stub does); -> (provider, reads)."""
+        rz = self.provider()
+        reads = []
+
+        def lines(src, key):
+            reads.append(key.x)
+            if key.x != 2:          # (the cells round the player: read)
+                return roadz.Lines.build([])
+            fail()
+            return None
+        rz.lines = lines
+        return rz, reads
+
+    def _run_want(self, rz, reads, cell, until, timeout=5.0):
+        mid = (roadz.PREFETCH_FAR_M + roadz.PREFETCH_WANT_FAR_M) / 2
+        rz._want("lidar", cell)
+        rz.prefetch([mapcells.CellKey(14, 1, 0)], where=lambda k: 10.0 if k.x == 1 else mid)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end and not until():
+            time.sleep(0.02)
+        time.sleep(0.3)         # (no more reads after it)
+
+    def test_a_wanted_cell_that_keeps_failing_is_left_until_asked_again(self):
+        """A wanted cell whose read keeps failing is read PREFETCH_WANT_TRIES times, then left (dropped past
+        PREFETCH_FAR_M as any cell): with no limit it was read again every minute while the player stayed within
+        24 km (Codex review of 99cf7113). A planning process asking again renews the want."""
+        rz, reads = self._failing_want(lambda: None)
+        cell = mapcells.CellKey(14, 2, 0)
+        with self.mock.patch.object(roadz, "PREFETCH_CELLS", 1), \
+                self.mock.patch.object(roadz, "PREFETCH_POLL_S", 0.05), \
+                self.mock.patch.object(roadz, "PREFETCH_RETRY_S", 0.0), \
+                self.mock.patch.object(roadz, "PREFETCH_WANT_TRIES", 3):
+            self._run_want(rz, reads, cell, lambda: rz.prefetch_state(cell) is None and reads.count(2) >= 3)
+            self.assertEqual(reads.count(2), 3, "read PREFETCH_WANT_TRIES times, then left")
+            self.assertIsNone(rz.prefetch_state(cell), "dropped past PREFETCH_FAR_M once the want ended")
+            rz._want("lidar", cell)         # (asked again: renewed)
+            rz.prefetch([mapcells.CellKey(14, 3, 0)], where=lambda k: 10.0 if k.x == 3 else
+                        (roadz.PREFETCH_FAR_M + roadz.PREFETCH_WANT_FAR_M) / 2)
+            end = time.monotonic() + 5.0
+            while time.monotonic() < end and reads.count(2) < 6:
+                time.sleep(0.02)
+            time.sleep(0.3)
+        self.assertEqual(reads.count(2), 6, "a renewed want is read again, as many times")
+
+    def test_a_404_ends_the_want_at_once(self):
+        """A read that found no data there (netfetch.NotFound) ends the want: not read again."""
+        import netfetch
+
+        def fail():
+            roadz._tl.failed = netfetch.NotFound("no such node")
+        rz, reads = self._failing_want(fail)
+        cell = mapcells.CellKey(14, 2, 0)
+        with self.mock.patch.object(roadz, "PREFETCH_CELLS", 1), \
+                self.mock.patch.object(roadz, "PREFETCH_POLL_S", 0.05), \
+                self.mock.patch.object(roadz, "PREFETCH_RETRY_S", 0.0):
+            self._run_want(rz, reads, cell, lambda: reads.count(2) >= 1 and rz.prefetch_state(cell) is None)
+        self.assertEqual(reads.count(2), 1)
+        self.assertIsNone(rz.prefetch_state(cell))
+
+    def test_a_want_not_asked_again_expires(self):
+        """A want older than PREFETCH_WANT_KEEP_S is a cell like the rest: dropped past PREFETCH_FAR_M unread."""
+        rz = self.provider()
+        reads = []
+        rz.lines = lambda src, key: reads.append(key.x) or roadz.Lines.build([])
+        cell = mapcells.CellKey(14, 2, 0)
+        with self.mock.patch.object(roadz, "PREFETCH_CELLS", 1), \
+                self.mock.patch.object(roadz, "PREFETCH_POLL_S", 0.05), \
+                self.mock.patch.object(roadz, "PREFETCH_WANT_KEEP_S", -1.0):
+            self._run_want(rz, reads, cell, lambda: 1 in reads and rz.prefetch_state(cell) is None)
+        self.assertEqual(reads, [1])
+        self.assertIsNone(rz.prefetch_state(cell))
+
+    def test_a_cell_read_from_disk_is_marked_used(self):
+        """A lidar cell read from disk (in a worker: the download cache's index never hears of it) gets its mtime
+        now, the cache's last use for files this server's own process did not read (cache.Cache.scan): one read on
+        every visit was as old as its download and among the first evicted when the disk ran short."""
+        rz = self.provider()
+        ln = roadz.Lines.build([], corrected=True)
+        p = rz._path("lidar", mapcells.CellKey(14, 1, 2))
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        ln.save(p)
+        with open(p + ".gaps.json", "w", encoding="utf-8") as fh:
+            fh.write("[]")
+        old = time.time() - 30 * 86400
+        for f in (p, p + ".gaps.json"):
+            os.utime(f, (old, old))
+        got = rz.lines("lidar", mapcells.CellKey(14, 1, 2))
+        self.assertIsNotNone(got)
+        for f in (p, p + ".gaps.json"):
+            self.assertGreater(os.path.getmtime(f), time.time() - 600, f"{os.path.basename(f)} not marked used")

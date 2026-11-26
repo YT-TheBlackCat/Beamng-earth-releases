@@ -1,0 +1,276 @@
+"""cpupin: the core split and the loading boost's CPU sets."""
+import os
+import sys
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import cpupin  # noqa: E402
+
+CORES = [((0, c), [c, c + 8]) for c in range(8)]     # 8 cores, 16 CPUs, siblings c and c + 8
+
+
+def fake_siblings(usable=None):
+    return [(k, c) for k, c in CORES if usable is None or set(c) <= set(usable)]
+
+
+class BoostTest(unittest.TestCase):
+    def test_split_and_boost(self):
+        with mock.patch.object(cpupin, "_siblings", side_effect=fake_siblings):
+            server, game = cpupin.split()
+            self.assertEqual(server, {6, 7, 14, 15})
+            b = cpupin.boosted(server, game)
+        self.assertTrue(server < b)
+        self.assertEqual(b - server, {3, 4, 5, 11, 12, 13})     # the game's last three of six cores, both siblings
+        self.assertLessEqual(len(b & game), len(game) // 2)
+
+    def test_boost_from_a_pinned_process(self):
+        # the server calls boosted() after pinning itself to its own CPUs: the game's are still found
+        with mock.patch.object(cpupin, "_siblings", side_effect=fake_siblings), \
+                mock.patch.object(cpupin.os, "sched_getaffinity", return_value={6, 7, 14, 15}, create=True):
+            self.assertEqual(cpupin.boosted({6, 7, 14, 15}, {0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13}),
+                             {3, 4, 5, 6, 7, 11, 12, 13, 14, 15})
+
+    def test_full_split_after_a_teleport(self):
+        # the settings page's teleportPriority: the server on every CPU, the game on its first two cores alone
+        with mock.patch.object(cpupin, "_siblings", side_effect=fake_siblings):
+            server, game = cpupin.split()
+            full = cpupin.full_split(server, game)
+        self.assertEqual(full[0], server | game)
+        self.assertEqual(full[1], {0, 1, 8, 9})
+        with mock.patch.object(cpupin, "_siblings", side_effect=fake_siblings):
+            self.assertIsNone(cpupin.full_split({6, 14}, {0, 1, 8, 9}), "no cores to take from a two-core game")
+        self.assertIsNone(cpupin.full_split(None, {1, 2}))
+
+    def test_teleport_priority_setting_read(self):
+        import json
+        import tempfile
+        d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(d, "settings"))
+        with open(os.path.join(d, "settings", "beamngEarth.json"), "w") as f:
+            json.dump({"teleportPriority": True}, f)
+        self.assertTrue(cpupin.player_settings(d).get("teleport_full"))
+        with open(os.path.join(d, "settings", "beamngEarth.json"), "w") as f:
+            json.dump({"teleportPriority": False}, f)
+        self.assertFalse(cpupin.player_settings(d).get("teleport_full"))
+
+    def test_native_threads(self):
+        # the native kernels' cap: none of its own on 8 cores (the CPU set caps them), one per physical server core on 4
+        with mock.patch.object(cpupin, "_siblings", side_effect=fake_siblings):
+            server, _game = cpupin.split()
+            self.assertIsNone(cpupin.native_threads(server))
+        deck = [((0, c), [c, c + 4]) for c in range(4)]
+
+        def deck_siblings(usable=None):
+            return [(k, c) for k, c in deck if usable is None or set(c) <= set(usable)]
+        with mock.patch.object(cpupin, "_siblings", side_effect=deck_siblings):
+            server, _game = cpupin.split(0.5)
+            self.assertEqual(server, {2, 3, 6, 7})
+            self.assertEqual(cpupin.native_threads(server), 2)
+            self.assertIsNone(cpupin.native_threads(None), "not split: no cap of its own")
+
+    def test_nothing_to_lend(self):
+        self.assertIsNone(cpupin.boosted(None, {1, 2}))
+        self.assertIsNone(cpupin.boosted({1}, set()))
+
+    @unittest.skipUnless(hasattr(os, "sched_getaffinity"), "Linux")
+    def test_pin_tree_keeps_this_process(self):
+        cpus = os.sched_getaffinity(0)
+        self.assertGreaterEqual(cpupin.pin_tree(cpus), 1)
+        self.assertEqual(os.sched_getaffinity(0), cpus)
+
+    def test_pin_tree_windows_active_children(self):
+        with mock.patch.object(cpupin, "WIN", True), \
+                mock.patch.object(cpupin, "_win_set", return_value=1), \
+                mock.patch.object(cpupin, "_win_processes") as mock_snap:
+            n = cpupin.pin_tree({0, 1})
+            self.assertGreaterEqual(n, 1)
+            mock_snap.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class WindowsSplitTest(unittest.TestCase):
+    """KyzoFox 1.5.56: the split on Windows, from the cores' processor masks (an i5-11400H: 6 cores, 12 threads)."""
+
+    def setUp(self):
+        self.masks = [0b11 << (2 * i) for i in range(6)]
+        self.old = cpupin._siblings
+        cores = cpupin.cores_from_masks(self.masks, list(range(12)))
+        cpupin._siblings = lambda usable=None: (cores if usable is None else
+                                                cpupin.cores_from_masks(self.masks, usable))
+
+    def tearDown(self):
+        cpupin._siblings = self.old
+        os.environ.pop("BNGE_SERVER_CORES", None)
+
+    def test_cores_from_masks(self):
+        cores = cpupin.cores_from_masks(self.masks, list(range(12)))
+        self.assertEqual([c for _k, c in cores], [[0, 1], [2, 3], [4, 5], [6, 7], [8, 9], [10, 11]])
+        # a process limited to some CPUs sees only those
+        self.assertEqual([c for _k, c in cpupin.cores_from_masks(self.masks, [0, 1, 2])], [[0, 1], [2]])
+
+    def test_two_cores_for_the_server_four_for_the_game(self):
+        server, game = cpupin.split()
+        self.assertEqual(server, {8, 9, 10, 11})
+        self.assertEqual(game, set(range(8)))
+
+    def test_server_cores_setting(self):
+        os.environ["BNGE_SERVER_CORES"] = "1"
+        self.assertEqual(cpupin.split()[0], {10, 11})
+        os.environ["BNGE_SERVER_CORES"] = "5"           # never more than half
+        self.assertEqual(len(cpupin.split()[0]), 6)
+        os.environ["BNGE_SERVER_CORES"] = "x"
+        self.assertEqual(cpupin.split()[0], {8, 9, 10, 11})
+
+    def test_mask(self):
+        self.assertEqual(cpupin._mask({8, 9, 10, 11}), 0xF00)
+        self.assertEqual(cpupin._bits(0xF00), [8, 9, 10, 11])
+
+
+class PlayerSettingsTest(unittest.TestCase):
+    """The settings page's Performance section (GitHub #529): the server's cores and priority from the mod's settings
+    file in the game's user folder, where nothing was set by hand."""
+
+    def write(self, d, name="beamngEarth.json"):
+        import json
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        os.makedirs(os.path.join(tmp.name, "settings"))
+        with open(os.path.join(tmp.name, "settings", name), "w", encoding="utf-8") as f:
+            json.dump(d, f)
+        return tmp.name
+
+    def test_choices_read(self):
+        self.assertEqual(cpupin.player_settings(self.write({"serverCores": "2", "serverPriority": "normal"})),
+                         {"cores": 2, "priority": "normal"})
+        # (Linux: the game writes its file names in lower case)
+        self.assertEqual(cpupin.player_settings(self.write({"serverCores": "3"}, "beamngearth.json")), {"cores": 3})
+        for d in ({}, {"serverCores": "auto", "serverPriority": "low"}, {"serverCores": "99", "serverPriority": 1},
+                  {"serverCores": None}, ["not", "a", "dict"]):
+            with self.subTest(d=d):
+                self.assertEqual(cpupin.player_settings(self.write(d)), {}, "the defaults")
+        self.assertEqual(cpupin.player_settings(None), {})
+        self.assertEqual(cpupin.player_settings("/nonexistent/user/dir"), {}, "no settings file: the defaults")
+
+    def test_ground_grid(self):
+        # the Low / Medium presets' lighter 2 m ground (GitHub #943): the launcher sets BNGE_GROUND_SQUARE from it
+        self.assertEqual(cpupin.player_settings(self.write({"groundGrid": "2"})), {"ground_square": "2"})
+        for v in ("1", None, 2, "4"):
+            with self.subTest(v=v):
+                self.assertEqual(cpupin.player_settings(self.write({"groundGrid": v})).get("ground_square"),
+                                 "2" if v == 2 else None)
+        # a file from before the setting: its quality preset's value (settings.lua PRESETS: Low and Medium 2 m)
+        for q, want in (("low", "2"), ("medium", "2"), ("high", None), ("custom", None), ("auto", None)):
+            with self.subTest(q=q):
+                self.assertEqual(cpupin.player_settings(self.write({"quality": q})).get("ground_square"), want)
+        self.assertIsNone(cpupin.player_settings(self.write({"quality": "medium", "groundGrid": "1"})).get("ground_square"),
+                          "the page's own choice wins over its preset")
+
+    def test_applied_where_nothing_was_set_by_hand(self):
+        user = self.write({"serverCores": "2", "serverPriority": "normal"})
+        env = {}
+        nice, notes = cpupin.apply_player_settings(user, 10, 10, env)
+        self.assertEqual((nice, env.get("BNGE_SERVER_CORES")), (0, "2"))
+        self.assertEqual(notes, ["2 cores", "normal priority"])
+        env = {"BNGE_SERVER_CORES": "1"}                    # run_server.bat's own line, a --nice given: they win
+        nice, notes = cpupin.apply_player_settings(user, 5, 10, env)
+        self.assertEqual((nice, env["BNGE_SERVER_CORES"], notes), (5, "1", []))
+        env = {}
+        self.assertEqual(cpupin.apply_player_settings(self.write({}), 10, 10, env), (10, []))
+        self.assertEqual(env, {}, "the defaults: nothing changed")
+
+    def test_two_of_four_cores(self):
+        # the reporter's i5-3470 (4 cores, no hyperthreads): the default split gives the server one core, the setting 2
+        four = [((0, c), [c]) for c in range(4)]
+        env = {}
+        cpupin.apply_player_settings(self.write({"serverCores": "2"}), 10, 10, env)
+        with mock.patch.object(cpupin, "_siblings", return_value=four), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BNGE_SERVER_CORES", None)
+            self.assertEqual(cpupin.split(), ({3}, {0, 1, 2}), "(the default: one core)")
+            os.environ["BNGE_SERVER_CORES"] = env["BNGE_SERVER_CORES"]
+            self.assertEqual(cpupin.split(), ({2, 3}, {0, 1}), "the setting: two")
+            os.environ["BNGE_SERVER_CORES"] = "4"
+            self.assertEqual(len(cpupin.split()[0]), 2, "never more than half")
+
+    def test_the_page_offers_what_the_server_reads(self):
+        import re
+        mod = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "mod",
+                           "beamng_earth")
+        with open(os.path.join(mod, "lua", "ge", "extensions", "beamngEarth", "settings.lua"), encoding="utf-8") as f:
+            lua = f.read()
+        with open(os.path.join(mod, "ui", "ui-vue", "mods", "beamngEarth", "earthSettingsStore.js"),
+                  encoding="utf-8") as f:
+            page = f.read()
+        for key, want in (("serverCores", ("auto",) + cpupin.CORE_CHOICES), ("serverPriority", cpupin.PRIORITIES)):
+            with self.subTest(key=key):
+                m = re.search(key + r" = \{ kind = 'enum', default = '(\w+)', values = \{ ([^}]*) \}", lua)
+                self.assertIsNotNone(m, "the mod's setting")
+                self.assertEqual(tuple(re.findall(r"'(\w+)'", m.group(2))), want)
+                self.assertEqual(m.group(1), want[0], "the default first")
+                row = re.search(r'\{ id: "' + key + r'".*?options: \[([^\]]*)\]', page, re.S)
+                self.assertIsNotNone(row, "the page's row")
+                self.assertEqual(tuple(re.findall(r'value: "(\w+)"', row.group(1))), want)
+
+    def test_3dmr_models_switch(self):
+        # the page's "3D models from 3dmr.eu" (settings.lua models3dmr, on by default): off reaches the worker
+        # processes as BNE_3DMR=off (threedmr.enabled; a BNE_ variable, so in revisit's code key)
+        self.assertEqual(cpupin.player_settings(self.write({"models3dmr": False})), {"models3dmr": False})
+        self.assertEqual(cpupin.player_settings(self.write({"models3dmr": True})), {}, "on: the default")
+        env = {}
+        self.assertEqual(cpupin.apply_player_settings(self.write({"models3dmr": False}), 10, 10, env),
+                         (10, ["no 3dmr.eu models"]))
+        self.assertEqual(env, {"BNE_3DMR": "off"})
+        env = {"BNE_3DMR": "on"}                            # set by hand: it wins
+        cpupin.apply_player_settings(self.write({"models3dmr": False}), 10, 10, env)
+        self.assertEqual(env, {"BNE_3DMR": "on"})
+        import re
+        mod = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "mod",
+                           "beamng_earth")
+        with open(os.path.join(mod, "lua", "ge", "extensions", "beamngEarth", "settings.lua"), encoding="utf-8") as f:
+            self.assertRegex(f.read(), r"models3dmr = \{ kind = 'bool', default = true,")
+        with open(os.path.join(mod, "ui", "ui-vue", "mods", "beamngEarth", "earthSettingsStore.js"),
+                  encoding="utf-8") as f:
+            self.assertTrue(re.search(r'\{ id: "models3dmr", type: "bool", default: true,', f.read()), "the page's row")
+
+
+class HybridCoresTest(unittest.TestCase):
+    """A machine whose cores do not all have the same number of threads (Intel 12th generation and later: performance
+    cores with two, efficiency cores with one, the efficiency cores numbered last)."""
+    # an i7-12700K: 8 performance cores (CPUs 0-15 in pairs) and 4 efficiency cores (CPUs 16-19)
+    I7_12700K = [((0, c), [2 * c, 2 * c + 1]) for c in range(8)] + [((0, 8 + e), [16 + e]) for e in range(4)]
+    # 8 performance and 12 efficiency cores, none with a second thread
+    NO_SECOND_THREADS = [((0, c), [c]) for c in range(20)]
+
+    def setUp(self):
+        self.old = os.environ.pop("BNGE_SERVER_CORES", None)
+
+    def tearDown(self):
+        os.environ.pop("BNGE_SERVER_CORES", None)
+        if self.old is not None:
+            os.environ["BNGE_SERVER_CORES"] = self.old
+
+    def split(self, cores, share=cpupin.SERVER_SHARE):
+        with mock.patch.object(cpupin, "_siblings", return_value=cores):
+            return cpupin.split(share)
+
+    def test_single_thread_cores_count_for_less(self):
+        # a quarter of 12 cores is 3; three whole cores are 6 CPUs, not the 3 CPUs of the last three efficiency cores
+        server, game = self.split(self.I7_12700K)
+        self.assertEqual(server, {14, 15, 16, 17, 18, 19}, "the four efficiency cores and one performance core")
+        self.assertEqual(game, set(range(14)))
+
+    def test_the_setting_counts_whole_cores_too(self):
+        os.environ["BNGE_SERVER_CORES"] = "2"
+        self.assertEqual(self.split(self.I7_12700K)[0], {16, 17, 18, 19})
+        os.environ["BNGE_SERVER_CORES"] = "8"            # never more than half of the cores
+        self.assertEqual(self.split(self.I7_12700K)[0], set(range(12, 20)))
+
+    def test_cores_of_one_width_split_as_before(self):
+        server, game = self.split(self.NO_SECOND_THREADS)
+        self.assertEqual(server, {15, 16, 17, 18, 19})
+        self.assertEqual(game, set(range(15)))

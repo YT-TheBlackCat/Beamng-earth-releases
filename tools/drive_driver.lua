@@ -1,0 +1,595 @@
+-- BeamNG.Earth GE-side per-frame test driver (docs/V1_4_SPEC.md 3.0, M0). tools/drive.py sends this
+-- file through the game's MCP run_lua; there is no mod file. Loading the chunk defines the global
+-- BNGE_DRIVE (first uninstalling a driver that a dead harness left behind) and returns 'ok'. Then:
+--   BNGE_DRIVE.install(cfgJson)  -> JSON {ok = true, ...} or {error = text}
+--   BNGE_DRIVE.poll()            -> JSON: the frames since the last poll, the driver state and one
+--                                   mod / perfmon snapshot (the harness calls it at most once a second)
+--   BNGE_DRIVE.uninstall()       -> 'uninstalled' (drive.py calls it in a finally block)
+--
+-- Per frame, from the onPreRender of an extension proxy (lua/common/extensions.lua:1081-1164
+-- newExtensionProxy + submitEventSinks, the mechanism flowgraph/manager.lua:222 uses; removed with
+-- proxy:destroy(); docs/research/2026-10-10-origin-distance.md section 6):
+--   - advance the profile by speed * dtSim (arc length s, profile time t), heading from the profile;
+--   - place the player with veh:setClusterPosRelRot(-1, x, y, z, q) (no reset: the probes/p6 rebase
+--     move kept 20.0 -> 20.1 m/s), q = the yaw from the heading commanded last frame to this one
+--     (a relative, world-frame rotation as tech/techCore.lua:909-912 and rebase.lua use it), and set
+--     the velocity with veh:applyClusterVelocityScaleAdd(-1, 0, vx, vy, vz) (scale 0 = replace,
+--     spawn.lua:534; funstuff.lua adds with scale 1);
+--   - height: ground profiles ray down with castRayStatic from HEAD_M above the last ground (only
+--     static collision: the TerrainBlock, never the render-only far tiles; RAY_UP above it when
+--     that misses) and add the clearance measured at install; a miss is a 'fall' (logged, the
+--     last ground height is kept). Flight
+--     profiles (points with `alt`, m AGL) fly at the start ground height + alt until M5's
+--     pose_reply.groundZ exists;
+--   - inputs are zeroed at install and at uninstall; the camera is never touched (it stays on the
+--     player);
+--   - records the frame: wall ms, flags (FLAG_*), the tile level under the player (the mod's
+--     farfield.exactState(), else a key lookup like tools/ball_drive.py).
+-- A rebase moves the player itself (rebase.moveVehicles, wrapped while installed): the driver's own
+-- state (position, heading, ground) goes through the same transform, and that frame places nothing.
+-- A jump of the player that is not a rebase (a teleport, a reset by hand) ends the run ('jump').
+-- Error paths: a failed install undoes every step it made; an error in a frame stops the run and
+-- parks the car (velocity 0, inputs zero); with no poll for WATCHDOG_MS (the harness died without its
+-- uninstall) the driver stops the same way and restores rebase.moveVehicles. The proxy itself is
+-- only destroyed by uninstall() (not from inside its own event); loading this chunk again always
+-- uninstalls the previous driver, also a half-installed or stopped one.
+
+local D = rawget(_G, 'BNGE_DRIVE')
+if type(D) == 'table' and D.uninstall then pcall(D.uninstall) end
+D = {}
+_G.BNGE_DRIVE = D
+
+local floor, abs, sqrt, min, max = math.floor, math.abs, math.sqrt, math.min, math.max
+local sin, cos, atan2, rad, deg = math.sin, math.cos, math.atan2, math.rad, math.deg
+
+D.RAY_UP = 1000          -- m above the last ground height where the fallback ground ray starts
+-- The ground ray starts this far above the last ground (+ HEAD_GRADE per m moved in the frame, at most HEAD_MAX_M):
+-- under an overpass deck (its underside 5-6 m over the road, roads.MIN_BRIDGE_HEADROOM_M) or a tunnel's ground. From
+-- RAY_UP it hit the deck's top and the driver set the car on it, 7-10 m up in one frame, and back down past it: the
+-- 150 mph I-10 Phoenix runs' "vehicle unstable: v = nan" under the arterial overpasses (and the car lifted onto the
+-- Deck Park Tunnel's park), 2026-11-03.
+D.HEAD_M, D.HEAD_GRADE, D.HEAD_MAX_M = 3.0, 0.15, 4.5
+D.RAY_LEN = 3000         -- m of ray (a miss: castRayStatic returns >= the length)
+D.MAX_VZ = 30            -- m/s; |vz| clamp of a ground profile (slope changes, rebase frames)
+D.JUMP_M = 500           -- m between the placed and the actual position that is not a rebase: stop
+D.REBASE_GRACE = 5       -- frames after a rebase in which the actual position may still be the old one
+D.RESYNC_DEG = 5         -- the measured heading this far from the commanded one (collision): resync
+D.RESYNC_EVERY = 30      -- frames between heading checks
+D.MAX_FRAMES = 20000     -- frame records kept between two polls (more: counted as dropped)
+D.WATCHDOG_MS = 60000    -- no poll for this long (the harness polls every second): stop and park
+D.NO_TILE = 99           -- `under` value of a frame with no shown tile under the player
+D.EXACT_LEVEL = -2       -- fallback exact level (v1.3.1 layout) when the mod has no exactState
+D.MAX_LEVEL = 9
+D.L0 = 256
+-- frame flags (bit values)
+D.FLAG_HEAVY = 1         -- the mod's governor ran a heavy op this frame (terrain commit, rebase, teleport)
+D.FLAG_REBASE = 2        -- rebase phase 1 (the vehicle move) ran this frame
+D.FLAG_HARNESS = 4       -- the harness did MCP work in this frame interval (poll)
+D.FLAG_FALL = 8          -- no ground under the placed position
+D.FLAG_MISS = 16         -- exact miss (mod metric, mesh mode)
+D.FLAG_OLD = 32          -- the tile under the player belongs to a previous anchor
+D.FLAG_SKIP = 64         -- nothing placed this frame (rebase frame, paused, done)
+D.ZERO_INPUTS = "input.event('throttle', 0, 2); input.event('brake', 0, 2); input.event('steering', 0, 2); "
+  .. "input.event('clutch', 0, 2); input.event('parkingbrake', 0, 2)"
+
+------------------------------------------------------------------------------------------
+-- pure helpers (unit-tested under luajit, mod/tests/test_drive_driver.lua)
+
+-- Heading in degrees (0 = north = +y, 90 = east = +x) of a direction.
+function D.headingOf(dx, dy) return deg(atan2(dx, dy)) % 360 end
+
+-- a - b wrapped to (-180, 180].
+function D.angleDiff(a, b)
+  local d = (a - b) % 360
+  if d > 180 then d = d - 360 end
+  return d
+end
+
+-- BeamNG quaternion of a turn about +z that changes a heading by dh degrees (clockwise from
+-- above). BeamNG quaternions rotate by the conjugate of the standard formula (geodesy.lua
+-- beamngQuat), so the standard (0, 0, sin(-dh/2), cos(-dh/2)) becomes (0, 0, sin(dh/2), cos(dh/2)).
+function D.yawQuat(dh)
+  local h = rad(dh) / 2
+  return 0, 0, sin(h), cos(h)
+end
+
+-- A profile from the config: { key = 't'|'s', points = {{u, speed, heading, alt?, vz?}, ...},
+-- flight = any point has alt, total = last u }. points: list of {t|s, speed, heading?, alt?, vz?};
+-- a missing heading is `heading0` (the vehicle's heading at install). Returns nil, error on bad input.
+function D.makeProfile(points, heading0)
+  if type(points) ~= 'table' or #points == 0 then return nil, 'profile has no points' end
+  local key = points[1].t ~= nil and 't' or 's'
+  local out, flight = {}, false
+  for i, p in ipairs(points) do
+    local u, v = tonumber(p[key]), tonumber(p.speed)
+    if not u then return nil, 'point ' .. i .. ': every point needs ' .. key end
+    if not v or v < 0 then return nil, 'point ' .. i .. ': speed must be >= 0' end
+    if i > 1 and u <= out[i - 1].u then return nil, 'point ' .. i .. ': ' .. key .. ' must increase' end
+    local alt = tonumber(p.alt)
+    if alt then flight = true end
+    out[i] = { u = u, speed = v, heading = tonumber(p.heading) or heading0 or 0, alt = alt, vz = tonumber(p.vz) }
+  end
+  return { key = key, points = out, flight = flight, total = out[#out].u, i = 1 }
+end
+
+-- Speed, heading, alt, vz of a profile at u (t or s), linear between points (heading along the
+-- shorter arc), held after the last point. Keeps a cursor: u only grows during a drive.
+function D.profileAt(prof, u)
+  local pts = prof.points
+  local i = prof.i or 1
+  if u < pts[i].u then i = 1 end
+  while i < #pts and u >= pts[i + 1].u do i = i + 1 end
+  prof.i = i
+  local a, b = pts[i], pts[i + 1]
+  if not b or u <= a.u then return a.speed, a.heading, a.alt, a.vz end
+  local f = (u - a.u) / (b.u - a.u)
+  local alt = (a.alt and b.alt) and (a.alt + f * (b.alt - a.alt)) or a.alt
+  local vz = (a.vz and b.vz) and (a.vz + f * (b.vz - a.vz)) or a.vz
+  return a.speed + f * (b.speed - a.speed), (a.heading + f * D.angleDiff(b.heading, a.heading)) % 360, alt, vz
+end
+
+-- Minimal JSON encoder (the GE has jsonEncode; this one is for plain luajit).
+local function encode(v)
+  local t = type(v)
+  if t == 'nil' then return 'null' end
+  if t == 'boolean' then return tostring(v) end
+  if t == 'number' then
+    if v ~= v or v == math.huge or v == -math.huge then return 'null' end
+    if v == floor(v) and abs(v) < 1e15 then return string.format('%d', v) end
+    return string.format('%.6g', v)
+  end
+  if t == 'string' then
+    return '"' .. v:gsub('[%c"\\]', function(c) return string.format('\\u%04x', c:byte()) end) .. '"'
+  end
+  local parts = {}
+  if #v > 0 or next(v) == nil then
+    for i = 1, #v do parts[i] = encode(v[i]) end
+    return '[' .. table.concat(parts, ',') .. ']'
+  end
+  for k, x in pairs(v) do parts[#parts + 1] = encode(tostring(k)) .. ':' .. encode(x) end
+  table.sort(parts)
+  return '{' .. table.concat(parts, ',') .. '}'
+end
+D.encode = encode
+
+local function toJson(v)
+  local je = rawget(_G, 'jsonEncode')
+  if je then return je(v) end
+  return encode(v)
+end
+
+-- A monotonic wall clock in ms (hptimer in the GE, as the mod's stopwatch.lua; else socket/os).
+function D.newClock()
+  local hp = rawget(_G, 'hptimer')
+  if hp then
+    local ok, t = pcall(hp)
+    if ok and t and t.stopAndReset then
+      local acc = 0
+      t:stopAndReset()
+      return function() acc = acc + t:stopAndReset(); return acc end
+    end
+  end
+  local okS, socket = pcall(require, 'socket')
+  local c = (okS and type(socket) == 'table' and socket.gettime) or os.clock
+  local t0 = c()
+  return function() return (c() - t0) * 1000 end
+end
+
+------------------------------------------------------------------------------------------
+-- engine side
+
+local function vehicle()
+  local f = rawget(_G, 'getPlayerVehicle')
+  return f and f(0)
+end
+
+-- Ground height under (x, y) by a static-collision ray from zTop down, or nil.
+local function groundAt(x, y, zTop)
+  local d = castRayStatic(vec3(x, y, zTop), vec3(0, 0, -1), D.RAY_LEN)
+  if d and d < D.RAY_LEN then return zTop - d end
+end
+
+-- The ground under (x, y) near zRef (the last ground, or the car's height): the first static collision under
+-- zRef + the head room (ds: m moved since zRef was measured), else (the ground rose over the ray's start) under
+-- zRef + RAY_UP; nil: none. D.groundNear for the tests.
+local function groundNear(x, y, zRef, ds)
+  local head = min(D.HEAD_MAX_M, D.HEAD_M + D.HEAD_GRADE * (ds or 0))
+  return groundAt(x, y, zRef + head) or groundAt(x, y, zRef + D.RAY_UP)
+end
+D.groundNear = groundNear
+
+local function governor()
+  local core = rawget(_G, 'beamngEarth_core')
+  return core and core._governor and core._governor()
+end
+
+-- Tile level under (x, y), whether it is a previous anchor's, and the exact-miss flag.
+local function underState(x, y)
+  local ff = package.loaded['beamngEarth/farfield']
+  if not ff then return nil, false, false end
+  if ff.exactState then return ff.exactState() end
+  -- a v1.3.1 mod: current-anchor tiles by key (keys L_i_j, i = floor(x / S)), no miss flag
+  if not ff._tile then return nil, false, false end
+  for l = D.EXACT_LEVEL, D.MAX_LEVEL do
+    local s = D.L0 * 2 ^ l
+    local t = ff._tile(l .. '_' .. floor(x / s) .. '_' .. floor(y / s))
+    if t and t.shown and not t.failed then return l, false, l ~= D.EXACT_LEVEL end
+  end
+  return nil, false, true
+end
+
+local function newFrames() return { ms = {}, flags = {}, under = {}, n = 0, dropped = 0 } end
+
+-- Velocity 0 and inputs zero (the car stays where it is).
+local function park(veh)
+  if not veh then return end
+  veh:applyClusterVelocityScaleAdd(-1, 0, 0, 0, 0)
+  veh:queueLuaCommand(D.ZERO_INPUTS)
+end
+
+-- Give rebase.moveVehicles back to the mod (when it is still our wrapper).
+local function unwrap()
+  local w = D.wrapped
+  if w and w.mod.moveVehicles == w.fn then w.mod.moveVehicles = w.orig end
+  D.wrapped = nil
+end
+
+-- End the run from inside a frame (error, watchdog): park, unwrap; the proxy stays, inert, until
+-- uninstall() or the next load of this chunk.
+local function stop(reason, err)
+  local s = D.state
+  if not s or s.done then return end
+  s.done, s.reason, s.endMs = true, reason, D.clock() - s.installMs
+  if err and not s.error then s.error = err end
+  unwrap()
+  pcall(park, vehicle())
+end
+
+local function record(ms, flags, under)
+  local f = D.frames
+  if f.n >= D.MAX_FRAMES then f.dropped = f.dropped + 1; return end
+  f.n = f.n + 1
+  f.ms[f.n] = floor(ms * 100 + 0.5) / 100
+  f.flags[f.n] = flags
+  f.under[f.n] = under or D.NO_TILE
+end
+
+-- Rebase phase 1 (called by the wrapped rebase.moveVehicles, inside the mod's onUpdate, before the
+-- tick of the same frame): the driver's frame changes with the world's.
+function D.onRebase(xf)
+  local s = D.state
+  if not s then return end
+  local x, y, z = xf:apply(s.x, s.y, s.z)
+  local hx, hy = sin(rad(s.cmd)), cos(rad(s.cmd))
+  local nx, ny = xf:apply(s.x + hx * 1000, s.y + hy * 1000, s.z)
+  local dh = D.angleDiff(D.headingOf(nx - x, ny - y), s.cmd)
+  local dz = z - s.z
+  s.x, s.y, s.z = x, y, z
+  s.ground, s.base = s.ground + dz, s.base + dz
+  s.hOff, s.cmd = s.hOff + dh, (s.cmd + dh) % 360
+  s.rebases = s.rebases + 1
+  s.rebaseFrame, s.skip = s.frame + 1, true -- the tick of this frame comes next
+end
+
+-- One frame. dtSim = 0: paused (nothing moves).
+-- A velocity physics can still produce for a profile speed: finite, horizontal speed not wildly
+-- above the profile's, vertical speed below a hard bound (flight profiles command large climbs).
+D.SANE_FACTOR, D.SANE_SLACK, D.SANE_VZ = 3, 30, 1e5
+function D.sane(v, speed)
+  local x, y, z = v.x, v.y, v.z
+  if x ~= x or y ~= y or z ~= z then return false end -- NaN
+  if abs(z) >= D.SANE_VZ then return false end           -- also +-inf
+  return sqrt(x * x + y * y) < D.SANE_FACTOR * (speed or 0) + D.SANE_SLACK
+end
+
+function D.tick(dtReal, dtSim)
+  local s = D.state
+  if not s then return end
+  s.frame = s.frame + 1
+  local now = D.clock()
+  local ms = now - s.lastTick
+  s.lastTick = now
+  local flags = 0
+  if D.harnessTag then D.harnessTag = false; flags = flags + D.FLAG_HARNESS end
+  if not s.done and now - (s.lastPoll or s.installMs) > D.WATCHDOG_MS then stop('watchdog') end
+  local gov = governor()
+  if gov and gov.isHeavyFrame and gov:isHeavyFrame() then flags = flags + D.FLAG_HEAVY end
+  if s.rebaseFrame == s.frame then flags = flags + D.FLAG_REBASE end
+
+  local veh = vehicle()
+  dtSim = tonumber(dtSim) or 0
+  if s.done or not veh or dtSim <= 0 then
+    local lvl, isOld, miss = underState(s.x, s.y)
+    if miss then flags = flags + D.FLAG_MISS end
+    if isOld then flags = flags + D.FLAG_OLD end
+    record(ms, flags + D.FLAG_SKIP, lvl)
+    return
+  end
+  -- a rebase frame: the mod's vehicle move is this frame's placement (the state moved with it)
+  local place = not s.skip
+  s.skip = false
+
+  -- a jump that is not a rebase: stop (the profile's frame is lost)
+  local p = veh:getPosition()
+  if place and s.frame - (s.rebaseFrame or -1e9) > D.REBASE_GRACE
+    and (p.x - s.x) ^ 2 + (p.y - s.y) ^ 2 > D.JUMP_M * D.JUMP_M then
+    -- on a path: back onto it where the car was set down (the edge guard's rescue at a late block), on from there
+    local back = s.path and D.nearestS(s.path, p.x, p.y, s.s)
+    if not back then
+      s.done, s.reason, s.endMs = true, 'jump', now - s.installMs
+      record(ms, flags + D.FLAG_SKIP, nil)
+      return
+    end
+    s.s, s.x, s.y, s.jumps = back, p.x, p.y, s.jumps + 1
+  end
+
+  -- advance along the profile (also in a rebase frame: the car keeps moving at its velocity)
+  local prof = s.prof
+  local speed, heading, alt, vz = D.profileAt(prof, prof.key == 't' and s.t or s.s)
+  local h = (heading + s.hOff) % 360
+  local ds = speed * dtSim
+  local hx, hy = sin(rad(h)), cos(rad(h))
+  if s.path then              -- along the path: its point at s, heading along it (3 m ahead)
+    local x1, y1 = D.pathXY(s.path, s.s + ds)
+    local x2, y2 = D.pathXY(s.path, s.s + ds + 3)
+    if x1 and x2 then
+      local dx, dy = x2 - x1, y2 - y1
+      local len = math.sqrt(dx * dx + dy * dy)
+      if len > 1e-6 then hx, hy = dx / len, dy / len end
+      h = D.headingOf(hx, hy)
+      s.x, s.y = x1, y1
+    else
+      s.x, s.y = s.x + hx * ds, s.y + hy * ds
+    end
+  else
+    s.x, s.y = s.x + hx * ds, s.y + hy * ds
+  end
+  s.s, s.t = s.s + ds, s.t + dtSim
+
+  if place then
+    local z
+    if alt then
+      z = s.base + alt
+      vz = vz or (z - s.z) / dtSim
+    else
+      local g = groundNear(s.x, s.y, s.ground, ds)
+      if g then
+        s.ground = g
+      else
+        s.falls = s.falls + 1
+        flags = flags + D.FLAG_FALL
+      end
+      z = s.ground + s.clearance
+      vz = max(-D.MAX_VZ, min(D.MAX_VZ, (z - s.z) / dtSim))
+    end
+    s.z = z
+
+    -- heading: the turn since last frame's command; now and then, follow the measured heading if
+    -- a collision turned the car
+    if s.frame % D.RESYNC_EVERY == 0 then
+      local d = veh:getDirectionVector()
+      if d and (d.x ~= 0 or d.y ~= 0) then
+        local mh = D.headingOf(d.x, d.y)
+        if abs(D.angleDiff(mh, s.cmd)) > D.RESYNC_DEG then s.cmd, s.resyncs = mh, s.resyncs + 1 end
+      end
+    end
+    -- the speed physics reports (the motion since the last placement) against the profile's
+    s.placed = s.placed + 1
+    -- (on a path the first placement moves the car from its spawn onto the path: a jump of a few metres reads as a
+    -- velocity of hundreds of m/s for a frame or two)
+    local v = s.placed > (s.path and 8 or 1) and veh:getVelocity()
+    -- a physics blow-up (in-game 2026-10-10: the user's lifted Hopper at 67 m/s went unstable and the
+    -- engine removed it; velocity read inf and the old driver kept going): stop at once
+    if v and not D.sane(v, speed) then
+      s.done, s.reason, s.endMs = true, 'unstable', now - s.installMs
+      s.error = s.error or string.format('vehicle unstable: v = (%s, %s, %s)', tostring(v.x), tostring(v.y), tostring(v.z))
+      unwrap()
+      record(ms, flags + D.FLAG_SKIP, nil)
+      return
+    end
+    if v then
+      s.vSum, s.vProfSum, s.vN = s.vSum + sqrt(v.x * v.x + v.y * v.y), s.vProfSum + s.lastSpeed, s.vN + 1
+    end
+    s.lastSpeed = speed
+    local qx, qy, qz, qw = D.yawQuat(D.angleDiff(h, s.cmd))
+    s.cmd = h
+    veh:setClusterPosRelRot(-1, s.x, s.y, z, qx, qy, qz, qw)
+    veh:applyClusterVelocityScaleAdd(-1, 0, hx * speed, hy * speed, vz)
+  else
+    flags = flags + D.FLAG_SKIP
+  end
+
+  local lvl, isOld, miss = underState(p.x, p.y)
+  if miss then flags = flags + D.FLAG_MISS end
+  if isOld then flags = flags + D.FLAG_OLD end
+  record(ms, flags, lvl)
+
+  local limit = s.km and s.km * 1000 or nil
+  if (limit and s.s >= limit) or (not limit and (prof.key == 't' and s.t or s.s) >= prof.total) then
+    s.done, s.reason, s.endMs = true, 'end', now - s.installMs
+    veh:applyClusterVelocityScaleAdd(-1, 0, 0, 0, 0) -- park: the harness uninstalls within a second
+  end
+end
+
+------------------------------------------------------------------------------------------
+-- install / poll / uninstall
+
+local function fail(text) return toJson({ error = text }) end
+
+-- A path to follow instead of the profile's headings (tools/nyc_speed.py: the GPS route along the streets, where a
+-- heading drifted into the buildings and the car went unstable): { la, lo, cum } with cum the metres along it.
+function D.makePath(pts)
+  if type(pts) ~= 'table' or #pts < 2 then return nil end
+  local la0, lo0 = tonumber(pts[1][1]), tonumber(pts[1][2])
+  local kx = 111320 * math.cos(math.rad(la0))
+  local path = { la = {}, lo = {}, cum = { 0 } }
+  for i, q in ipairs(pts) do
+    path.la[i], path.lo[i] = tonumber(q[1]), tonumber(q[2])
+    if i > 1 then
+      local dx = (path.lo[i] - path.lo[i - 1]) * kx
+      local dy = (path.la[i] - path.la[i - 1]) * 110540
+      path.cum[i] = path.cum[i - 1] + math.sqrt(dx * dx + dy * dy)
+    end
+  end
+  path.k = 1
+  return path
+end
+
+-- The path's point at s metres (lat, lon), linear between its points; k: the segment search's start (kept).
+function D.pathAt(path, s)
+  local n = #path.cum
+  local k = path.k or 1
+  if s <= 0 then k = 1 end
+  while k < n - 1 and path.cum[k + 1] < s do k = k + 1 end
+  while k > 1 and path.cum[k] > s do k = k - 1 end
+  path.k = k
+  local seg = path.cum[k + 1] - path.cum[k]
+  local f = seg > 0 and math.max(0, math.min(1, (s - path.cum[k]) / seg)) or 0
+  return path.la[k] + f * (path.la[k + 1] - path.la[k]), path.lo[k] + f * (path.lo[k + 1] - path.lo[k])
+end
+
+-- The path's arc length nearest (x, y), searched within NEAR_SEARCH_M of s (every 4 m), or nil (too far off it).
+D.NEAR_SEARCH_M = 600
+D.NEAR_MAX_M = 80
+function D.nearestS(path, x, y, s)
+  local best, bd = nil, D.NEAR_MAX_M * D.NEAR_MAX_M
+  for t = math.max(0, s - D.NEAR_SEARCH_M), s + D.NEAR_SEARCH_M, 4 do
+    local px, py = D.pathXY(path, t)
+    if not px then return nil end
+    local d = (px - x) ^ 2 + (py - y) ^ 2
+    if d < bd then best, bd = t, d end
+  end
+  return best
+end
+
+-- World x, y (the mod's current anchor) of the path at s.
+function D.pathXY(path, s)
+  local st = rawget(_G, 'beamngEarth_core') and beamngEarth_core._state()
+  if not (st and st.anchor) then return nil end
+  local la, lo = D.pathAt(path, s)
+  local x, y = st.anchor:geodeticToEnu(la, lo, 0)
+  return x, y
+end
+
+-- cfg (JSON text or a table): { points = {...} (see makeProfile), km = total km (optional: else the
+-- profile's end), clearance = m (optional: measured), exactLevel = n (optional, v1.3.1 mod only) }
+function D.install(cfg)
+  if D.installed then return fail('already installed') end
+  if type(cfg) == 'string' then cfg = jsonDecode(cfg) end
+  local veh = vehicle()
+  if not veh then return fail('no player vehicle') end
+  if not rawget(_G, 'newExtensionProxy') then return fail('newExtensionProxy missing') end
+  local p = veh:getPosition()
+  local g = groundNear(p.x, p.y, p.z)
+  if not g then return fail('no ground under the player') end
+  local d = veh:getDirectionVector()
+  local h0 = D.headingOf(d.x, d.y)
+  local prof, err = D.makeProfile(cfg.points, h0)
+  if not prof then return fail(err) end
+  D.EXACT_LEVEL = tonumber(cfg.exactLevel) or D.EXACT_LEVEL
+  D.clock = D.clock or D.newClock()
+  D.frames = newFrames()
+  D.harnessTag = true -- the rest of this MCP call (encoding, the HTTP answer) lands in the first frame
+  local path = cfg.path and D.makePath(cfg.path)
+  local sx, sy = p.x, p.y
+  if path then
+    sx, sy = D.pathXY(path, 0)
+    if not sx then return fail('no anchor for the path') end
+  end
+  D.state = {
+    prof = prof, km = tonumber(cfg.km), x = sx, y = sy, z = p.z, s = 0, t = 0, path = path,
+    ground = g, base = g, clearance = tonumber(cfg.clearance) or max(0.05, min(5, p.z - g)),
+    cmd = h0, hOff = 0, frame = 0, lastTick = D.clock(), installMs = D.clock(), lastPoll = D.clock(),
+    falls = 0, resets = 0, rebases = 0, resyncs = 0, jumps = 0, vSum = 0, vProfSum = 0, vN = 0, placed = 0, lastSpeed = 0,
+    vehId = veh:getID(), done = false, reason = nil, skip = false, rebaseFrame = nil,
+  }
+  -- from here on uninstall() undoes every step, also when one of them fails
+  D.installed = true
+  local okI, errI = pcall(function()
+    veh:queueLuaCommand(D.ZERO_INPUTS)
+
+    -- the mod's rebase moves the player: follow it (restored at uninstall)
+    local rb = package.loaded['beamngEarth/rebase']
+    if rb and rb.moveVehicles then
+      local orig = rb.moveVehicles
+      D.wrapped = { mod = rb, orig = orig }
+      D.wrapped.fn = function(xf, ...)
+        local moved, playerId = orig(xf, ...)
+        local ok, e = pcall(D.onRebase, xf)
+        if not ok and D.state then D.state.error = 'onRebase: ' .. tostring(e) end
+        return moved, playerId
+      end
+      rb.moveVehicles = D.wrapped.fn
+    end
+
+    local sink = {}
+    function sink:onPreRender(dtReal, dtSim)
+      local ok, e = pcall(D.tick, dtReal, dtSim)
+      if not ok then pcall(stop, 'error', tostring(e)) end
+    end
+    function sink:onVehicleResetted(vid)
+      if D.state and vid == D.state.vehId then D.state.resets = D.state.resets + 1 end
+    end
+    D.proxy = newExtensionProxy(nil, 'beamngEarthDrive')
+    D.proxy:submitEventSinks({ sink }, {})
+  end)
+  if not okI then
+    pcall(D.uninstall)
+    return fail('install: ' .. tostring(errI))
+  end
+  return toJson({ ok = true, x = p.x, y = p.y, z = p.z, ground = g, clearance = D.state.clearance, heading = h0,
+    key = prof.key, total = prof.total, flight = prof.flight, points = #prof.points })
+end
+
+-- The poll as a table (poll() encodes it). Tags the frame interval that will contain this MCP work.
+function D.pollTable()
+  D.harnessTag = true
+  local pm = rawget(_G, 'beamngEarth_perfmon')
+  if pm and pm.tagHarness then pm.tagHarness() end
+  local s = D.state or {}
+  if D.clock then s.lastPoll = D.clock() end
+  local f = D.frames or newFrames()
+  D.frames = newFrames()
+  local out = {
+    wallMs = D.clock and s.installMs and (D.clock() - s.installMs) or 0,
+    frames = { ms = f.ms, flags = f.flags, under = f.under, dropped = f.dropped },
+    drive = { s = s.s, t = s.t, x = s.x, y = s.y, z = s.z, heading = s.cmd, done = s.done, reason = s.reason,
+      error = s.error, endMs = s.endMs, falls = s.falls, resets = s.resets, rebases = s.rebases, resyncs = s.resyncs, jumps = s.jumps,
+      vSum = s.vSum, vProfSum = s.vProfSum, vN = s.vN },
+  }
+  -- the terrain under the car (a bridge: the car well above it; a tunnel: well below; tools/bridgefps.py)
+  if s.x and s.y and core_terrain and core_terrain.getTerrainHeight then
+    local ok, h = pcall(core_terrain.getTerrainHeight, vec3(s.x, s.y, 0))
+    if ok then out.drive.terr = h end
+  end
+  local core = rawget(_G, 'beamngEarth_core')
+  if core and core.status then
+    local ok, st = pcall(function() return loadstring('return ' .. core.status())() end)
+    if ok then out.mod = st else out.modError = tostring(st) end
+  end
+  if pm and pm.snapshot then out.perf = pm.snapshot() end
+  if core and core.hitches then out.hitches = core.hitches() end   -- what each frame over 50 ms went to (core.lua)
+  return out
+end
+
+function D.poll() return toJson(D.pollTable()) end
+
+function D.uninstall()
+  if D.proxy then pcall(function() D.proxy:destroy() end) end
+  D.proxy = nil
+  unwrap()
+  local veh = vehicle()
+  if veh and D.installed then
+    pcall(function()
+      -- park on the ground under the car, at rest, inputs zero
+      local p = veh:getPosition()
+      local g = groundNear(p.x, p.y, p.z)
+      if g and D.state then veh:setClusterPosRelRot(-1, p.x, p.y, g + D.state.clearance, 0, 0, 0, 1) end
+      park(veh)
+    end)
+  end
+  D.installed = false
+  return 'uninstalled'
+end
+
+return 'ok'

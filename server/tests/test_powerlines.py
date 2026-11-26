@@ -1,0 +1,382 @@
+"""High-voltage lines and substations (earthfast.power_line_layout, earthfast.substation_yard; powerlines.py): a tower
+at every vertex outside substations, none inside; a line end where a line reaches a substation, its conductors on the
+strain insulators of the kit's gantries there, lines ending close by sharing it; towers shared where lines meet; the
+kit at a line end facing the line, every busbar over its column of supports (West Coast USA's yard); the rest of a
+yard filled with the largest kit that fits, inside it and clear of the anchored kits; a small yard the smaller kit;
+the fence along the whole edge."""
+import sys
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))     # (power_reference: the original NumPy test oracle)
+import fast  # noqa: E402
+import powerlines  # noqa: E402
+from power_reference import margin as road_margin  # noqa: E402
+
+BOX = [-1e4, -1e4, 1e4, 1e4]
+
+
+def layout(lines, stop=None):
+    pts = np.ascontiguousarray(np.concatenate(lines), np.float64)
+    off = np.cumsum([0] + [len(r) for r in lines]).astype(np.int64)
+    stop = np.zeros(len(pts), bool) if stop is None else np.asarray(stop, bool)
+    return fast._ef.power_line_layout(pts, off, stop, powerlines.ARMS, powerlines.SAG, powerlines.SEG_M,
+                                      powerlines.MIN_SPAN_M, powerlines.MAX_SPAN_M, powerlines.DEDUPE_M,
+                                      powerlines.END_MERGE_M, powerlines.GANTRY_FRONT, BOX)
+
+
+def yard(rings, anchors=np.zeros((0, 3))):
+    pts = np.ascontiguousarray(np.concatenate(rings), np.float64)
+    ro = np.cumsum([0] + [len(r) for r in rings]).astype(np.int64)
+    groups = sorted(powerlines.PARTS)
+    kits = np.array([k[0] for k in powerlines.KITS], np.float64)
+    parts = np.array([[k, groups.index(g), x, y] for k, (_, ps) in enumerate(powerlines.KITS) for g, x, y in ps])
+    got, fence = fast._ef.substation_yard(pts, ro, kits, parts, powerlines.YARD_GAP,
+                                          np.asarray(anchors, np.float64).reshape(-1, 3), 0,
+                                          list(powerlines.ANCHOR_AT), powerlines.YARD_MAX_KITS, powerlines.FENCE_LEN,
+                                          BOX)
+    return [(groups[int(g)], x, y, yaw) for g, x, y, yaw in got], fence
+
+
+def square(x0, y0, w, h):
+    return np.array([[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h]], np.float64)
+
+
+class LineTest(unittest.TestCase):
+    def test_towers_and_conductors(self):
+        towers, gantries, wp, wo = layout([np.array([[0, 0, 0], [300, 0, 0], [600, 0, 0]], np.float64)])
+        self.assertEqual(len(towers), 3)
+        self.assertEqual(len(gantries), 0)
+        self.assertEqual(len(wo) - 1, 2 * len(powerlines.ARMS))           # two spans, six conductors each
+        self.assertTrue(np.allclose(towers[:, 3], 0.0))                   # turned along the line
+        w = wp[wo[0]:wo[1]]
+        self.assertAlmostEqual(w[0][2], powerlines.ARMS[0][1])           # from the insulator ...
+        self.assertLess(w[len(w) // 2][2], w[0][2] - 5.0)                # ... sagging between towers
+
+    def test_into_a_substation(self):
+        # the line's last two vertices in a substation: no towers there, a line end at the first, no span on
+        line = np.array([[0, 0, 0], [200, 0, 0], [260, 0, 0], [290, 0, 0]], np.float64)
+        towers, ends, wp, wo = layout([line], [False, False, True, True])
+        self.assertEqual(sorted(towers[:, 0].tolist()), [0.0, 200.0])
+        self.assertEqual(len(ends), 1)
+        self.assertTrue(np.allclose(ends[0], [260.0, 0.0, 0.0, 0.0]))     # heading into the substation: +x
+        last = np.array([wp[b - 1] for b in wo[1:]])
+        last = last[last[:, 0] > 250]
+        self.assertEqual(len(last), len(powerlines.ARMS))                # every conductor ends on the gantries ...
+        self.assertTrue(np.allclose(last[:, 2], powerlines.GANTRY_H))
+        self.assertTrue(np.allclose(last[:, 0], 260.0 - powerlines.GANTRY_FRONT))   # ... in front, toward the line
+        # each side of the line to its own gantry's three insulators
+        lat = np.sort(last[:, 1])
+        g = powerlines.GANTRY_LAT
+        self.assertTrue(np.allclose(lat, [-g - 1.75, -g, -g + 1.75, g - 1.75, g, g + 1.75]))
+        # a line starting in the substation: the same sides in the world
+        towers, ends, wp, wo = layout([line[::-1].copy()], [True, True, False, False])
+        self.assertTrue(np.allclose(ends[0][:2], [260.0, 0.0]))
+        first = np.array([wp[a] for a in wo[:-1]])
+        first = first[first[:, 0] > 250]
+        self.assertTrue(np.allclose(np.sort(first[:, 1]), lat))
+
+    def test_ends_merge(self):
+        # two lines ending 12 m apart: one end, both lines' conductors on it
+        a = np.array([[0, 0, 0], [200, 0, 0], [260, 0, 0]], np.float64)
+        b = np.array([[0, 12, 0], [200, 12, 0], [260, 12, 0]], np.float64)
+        _, ends, wp, wo = layout([a, b], [False, False, True, False, False, True])
+        self.assertEqual(len(ends), 1)
+        last = np.array([wp[q - 1] for q in wo[1:]])
+        self.assertTrue(np.all(np.abs(last[last[:, 0] > 250][:, 1]) < powerlines.GANTRY_LAT + 2.0))
+
+    def test_shared_tower(self):
+        a = np.array([[0, 0, 0], [300, 0, 0]], np.float64)
+        b = np.array([[300, 2, 0], [300, 300, 0]], np.float64)
+        towers, _, _, _ = layout([a, b])
+        self.assertEqual(len(towers), 3)                                  # the lines' meeting: one tower
+
+
+class YardTest(unittest.TestCase):
+    def test_big_yard(self):
+        ring = square(0, 0, 120, 60)
+        got, fence = yard([ring])
+        self.assertIn("sub_breaker", [g for g, *_ in got])
+        kits = sum(g == "sub_breaker" for g, *_ in got)
+        self.assertGreaterEqual(kits, 4)
+        for g, x, y, yaw in got:
+            self.assertTrue(0 < x < 120 and 0 < y < 60, (g, x, y))
+        self.assertTrue(all(abs(yaw % 180) < 1e-6 or abs(yaw % 180 - 180) < 1e-6 for *_, yaw in got))
+        # the fence: the whole edge (360 m of 2.04 m panels), on it
+        self.assertGreaterEqual(len(fence), int(360 / powerlines.FENCE_LEN))
+        on = [min(abs(x), abs(x - 120), abs(y), abs(y - 60)) < 1e-6 for x, y, _ in fence]
+        self.assertTrue(all(on))
+
+    def test_small_yard(self):
+        got, _ = yard([square(0, 0, 26, 24)])
+        self.assertEqual(sorted(g for g, *_ in got), ["sub_mast", "sub_transformer"])
+
+    def test_line_end_kit(self):
+        # a line coming in from the west (heading +x) to (20, 50) in a 120 x 100 yard: the big kit there, its gantries
+        # 5.8 m either side of the end, facing the line (their +y west: yaw 90 degrees, x north), every busbar (29.5 m
+        # along the gantry's -y: east, into the yard) over its column of six supports; the rest filled clear of it
+        got, _ = yard([square(0, 0, 120, 100)], anchors=[[20.0, 50.0, 0.0]])
+        gantries = sorted((round(y, 2), round(x, 2), yaw) for g, x, y, yaw in got if g == "gantry")
+        self.assertGreaterEqual(len(gantries), 2)
+        g = powerlines.GANTRY_LAT
+        near = [q for q in gantries if abs(q[1] - 20.0) < 1.0 and abs(q[0] - 50.0) < g + 0.5]
+        self.assertEqual([round(q[0] - 50.0, 1) for q in near], [round(-g + 0.045, 1), round(g + 0.045, 1)])
+        self.assertTrue(all(abs(q[2] - 90.0) < 1e-6 for q in near))
+        supports = [(x, y) for g_, x, y, _ in got if g_ == "sub_support"]
+        for y, x, _ in near:
+            under = [s for s in supports if abs(s[1] - y) < 1.2 and x - 4.0 < s[0] < x + 29.5]
+            self.assertEqual(len(under), 6, (x, y))
+        # the other kits clear of it: no part of another kit within its footprint
+        breakers = [(x, y) for g_, x, y, _ in got if g_ == "sub_breaker"]
+        self.assertGreater(len(breakers), 1)
+        self.assertEqual(sum(1 for x, y in breakers if abs(x - 20.0) < 25 and abs(y - 50.0) < 13), 1)
+
+    def test_turned_yard(self):
+        # a yard along a diagonal: the kits turned with it
+        c, s = np.cos(np.radians(30)), np.sin(np.radians(30))
+        ring = square(-60, -30, 120, 60) @ np.array([[c, s], [-s, c]])
+        got, _ = yard([ring])
+        yaws = {round(yaw % 180, 3) for *_, yaw in got}
+        self.assertEqual(yaws, {30.0})
+
+
+
+class VoltageTest(unittest.TestCase):
+    """Lines under HV_MIN_V go on poles (GitHub #787: a 66 kV line on street poles in Shepparton drawn as lattice pylons)."""
+
+    def test_low_voltage(self):
+        import powerlines as pl
+        self.assertTrue(pl.low_voltage('{"power":"line","voltage":"66000"}'))
+        self.assertTrue(pl.low_voltage('{"voltage":"33000;11000"}'))
+        self.assertFalse(pl.low_voltage('{"voltage":"132000;66000"}'), "a circuit at 132 kV: the towers")
+        self.assertFalse(pl.low_voltage('{"voltage":"220000"}'))
+        self.assertFalse(pl.low_voltage('{"power":"line"}'), "no voltage mapped: the towers")
+        self.assertFalse(pl.low_voltage('{"voltage":"high"}'))
+        self.assertFalse(pl.low_voltage(""))
+
+class OffRoadsTest(unittest.TestCase):
+    """TGForever Discord 2026-10-28: a pylon on a highway's shoulder (its mapped tower node a few metres off)."""
+
+    def test_tower_moved_off_the_carriageway(self):
+        import gasstations
+        import geodesy
+        frame = geodesy.EnuFrame(40.0, -105.0)
+        road = (np.array([[-100.0, 0.0], [100.0, 0.0]]), 5.0)       # a centreline along x, 10 m carriageway
+        old = gasstations.drive_lines
+        gasstations.drive_lines = lambda frame, layers, x, y, r: [road]
+        try:
+            class Md:
+                def cell(self, key, layers, kind):
+                    raise OSError("not here")
+            e, n = np.array([10.0, 20.0, 30.0]), np.array([2.0, -1.0, 40.0])
+            la, lo, _ = frame.enu_to_geodetic(e, n, np.zeros(3))
+            e2, n2 = powerlines._off_roads(frame, Md(), e, n, np.stack([lo, la], -1))
+        finally:
+            gasstations.drive_lines = old
+        want = 5.0 + powerlines.TOWER_ROAD_CLEAR_M
+        self.assertAlmostEqual(n2[0], want)            # (straight away from the road, on its own side)
+        self.assertAlmostEqual(n2[1], -want)
+        self.assertAlmostEqual(e2[0], 10.0)
+        self.assertAlmostEqual(e2[1], 20.0)
+        self.assertEqual((e2[2], n2[2]), (30.0, 40.0))  # (far off it: where it is mapped)
+
+    def moved(self, roads, e, n):
+        import gasstations
+        import geodesy
+        frame = geodesy.EnuFrame(49.4, 17.45)
+        old = gasstations.drive_lines
+        gasstations.drive_lines = lambda frame, layers, x, y, r: roads
+        try:
+            class Md:
+                def cell(self, key, layers, kind):
+                    raise OSError("not here")
+            e, n = np.asarray(e, np.float64), np.asarray(n, np.float64)
+            la, lo, _ = frame.enu_to_geodetic(e, n, np.zeros(len(e)))
+            return powerlines._off_roads(frame, Md(), e, n, np.stack([lo, la], -1))
+        finally:
+            gasstations.drive_lines = old
+
+    def test_between_dual_carriageways(self):
+        # GitHub #550: a tower 0.8 m off one of the D1's carriageways, the other 13 m away: pushed off the one onto
+        # the other and back, it stood on the motorway. Now clear of both.
+        roads = [(np.array([[-300.0, 0.0], [300.0, 0.0]]), 4.0), (np.array([[-300.0, 13.0], [300.0, 13.0]]), 4.0)]
+        e2, n2 = self.moved(roads, [0.0], [0.8])
+        m = road_margin(np.array([[e2[0], n2[0]]]), roads, powerlines.TOWER_ROAD_CLEAR_M)[0]
+        self.assertGreaterEqual(m, -1e-6)
+        self.assertLess(np.hypot(e2[0], n2[0] - 0.8), 15.0)       # the nearest clear spot: just off the one road
+
+    def test_in_a_junction_corner(self):
+        # a tower in the corner of a crossroads: clear of both roads
+        roads = [(np.array([[-300.0, 0.0], [300.0, 0.0]]), 5.0), (np.array([[0.0, -300.0], [0.0, 300.0]]), 5.0)]
+        e2, n2 = self.moved(roads, [3.0], [4.0])
+        self.assertGreaterEqual(road_margin(np.array([[e2[0], n2[0]]]), roads, powerlines.TOWER_ROAD_CLEAR_M)[0], -1e-6)
+
+class TowerFootprintTest(unittest.TestCase):
+    """The native layout decides yaw; check its emitted rows against the tile's authoritative solved roads."""
+
+    def place(self, lines=(), decks=(), clearance=None, tags=None):
+        import furniture
+        import mapgeom
+        from test_roads import FRAME
+        la, lo, _ = FRAME.enu_to_geodetic(np.array([100., 200.]), np.array([100., 100.]), 0.)
+        infra = mapgeom.Features(
+            layer="infrastructure", ids=np.array(["line"]), kind=np.array([mapgeom.LINE], np.uint8),
+            part_off=np.array([0, 1], np.int64), ring_off=np.array([0, 1], np.int64),
+            coord_off=np.array([0, 2], np.int64), lonlat=np.column_stack([lo, la]),
+            attrs={"class": np.array(["power_line"]), **({"tags": np.array([tags], object)} if tags else {})},
+            rules={})
+
+        class Md:
+            def cell(self, key, layers, kind):
+                from types import SimpleNamespace
+                return SimpleNamespace(layers={"infrastructure": infra} if "infrastructure" in layers else {"roads": None})
+
+        props, wires = [], []
+        if clearance is None:
+            clearance = furniture.RoadClearance(lines, decks, bounds=(0., 0., 256., 256.))
+        powerlines.tile_lines(FRAME, 0, 0, Md(), lambda la, lo: np.zeros(np.shape(la)), props, wires,
+                              clearance=clearance)
+        return props, wires
+
+    def test_service_road_rejects_collider_but_keeps_conductors(self):
+        service = (4., np.array([[100., 0., 0.], [100., 256., 0.]]))
+        before, old_wires = self.place()
+        after, wires = self.place([service])
+        self.assertEqual(len(before), 2)
+        self.assertEqual(len(after), 1)
+        self.assertGreater(after[0][1], 190., "only the tower clear of the service carriageway stays")
+        self.assertEqual(len(wires), 6)
+        self.assertEqual(len(wires), len(old_wires))
+        for (a, ar), (b, br) in zip(wires, old_wires):
+            np.testing.assert_array_equal(a, b)
+            self.assertEqual(ar, br)
+
+    def test_low_voltage_on_poles(self):
+        """A 66 kV line: the wooden poles with three conductors, not left out (GitHub #797) nor pylons (#787)."""
+        props, wires = self.place(tags='{"power":"line","voltage":"66000"}')
+        self.assertEqual({r[0] for r in props}, {powerlines.G_POLE})
+        self.assertEqual(len(props), 2)
+        self.assertEqual(props[0][6], powerlines.POLE_H)
+        self.assertEqual(len(wires), 3)
+        self.assertTrue(all(r == powerlines.POLE_WIRE_R for _, r in wires))
+        top = max(float(np.asarray(w)[:, 2].max()) for w, _ in wires)
+        self.assertAlmostEqual(top, 9.21 * powerlines.POLE_H / powerlines.POLE_SHAPE_H, delta=0.05)
+        hv, hw = self.place(tags='{"power":"line","voltage":"220000"}')
+        self.assertEqual({r[0] for r in hv}, {powerlines.G_PYLON})
+        self.assertEqual(len(hw), 6)
+
+    def test_mapped_pole_supports_put_a_high_voltage_line_on_poles(self):
+        """(PR #919 by wyo-backroads) A 115 kV line whose mapped supports (its way's nodes) are power=pole points: the
+        wooden poles; mostly power=tower points, or none mapped: the pylons."""
+        import mapgeom
+        from test_roads import FRAME
+        la, lo, _ = FRAME.enu_to_geodetic(np.array([100., 200.]), np.array([100., 100.]), 0.)
+
+        def run(classes):
+            n = 1 + len(classes)
+            infra = mapgeom.Features(
+                layer="infrastructure", ids=np.array(["line"] + [f"p{i}" for i in range(len(classes))]),
+                kind=np.array([mapgeom.LINE] + [mapgeom.POINT] * len(classes), np.uint8),
+                part_off=np.arange(n + 1, dtype=np.int64), ring_off=np.arange(n + 1, dtype=np.int64),
+                coord_off=np.r_[0, 2 + np.arange(n)].astype(np.int64),
+                lonlat=np.vstack([np.column_stack([lo, la]), np.column_stack([lo, la])[:len(classes)]]),
+                attrs={"class": np.array(["power_line"] + classes),
+                       "tags": np.array(['{"power":"line","voltage":"115000"}'] + ["{}"] * len(classes), object)},
+                rules={})
+
+            class Md:
+                def cell(self, key, layers, kind):
+                    from types import SimpleNamespace
+                    return SimpleNamespace(layers={"infrastructure": infra} if "infrastructure" in layers
+                                           else {"roads": None})
+            props, wires = [], []
+            powerlines.tile_lines(FRAME, 0, 0, Md(), lambda la, lo: np.zeros(np.shape(la)), props, wires)
+            return {r[0] for r in props}, len(wires)
+        self.assertEqual(run(["power_pole", "power_pole"]), ({powerlines.G_POLE}, 3))
+        self.assertEqual(run(["power_tower", "power_tower"]), ({powerlines.G_PYLON}, 6))
+        self.assertEqual(run([]), ({powerlines.G_PYLON}, 6))
+        self.assertEqual(run(["power_pole", "power_tower"]), ({powerlines.G_PYLON}, 6), "no majority: the towers")
+
+    def test_uses_actual_mapped_width(self):
+        # The pivot is outside the class-default 8 m road, but not a source-mapped 24 m carriageway.
+        wide = (12., np.array([[110., 0., 0.], [110., 256., 0.]]))
+        props, wires = self.place([wide])
+        self.assertEqual(len(props), 1)
+        self.assertGreater(props[0][1], 190.)
+        self.assertTrue(wires)
+
+    def test_real_clearance_below_a_high_bridge_is_preserved(self):
+        xy = np.array([[0., 100.], [256., 100.]])
+        high = (np.column_stack([xy, np.full(2, 50.)]), 4.)
+        low = (np.column_stack([xy, np.full(2, 20.)]), 4.)
+        self.assertEqual(len(self.place(decks=[high])[0]), 2)
+        self.assertEqual(self.place(decks=[low])[0], [])
+
+    def test_per_segment_taper_keeps_the_other_tower_and_every_conductor(self):
+        # A 10 m offset clears the stock tower beside the narrow segment, but not the widened continuation.
+        line = np.array([[0., 110., 0.], [150., 110., 0.], [256., 110., 0.]])
+        _, old_wires = self.place()
+        before, _ = self.place([(4., line)])
+        after, wires = self.place([(np.array([4., 12.]), line)])
+        self.assertEqual(len(before), 2)
+        self.assertEqual(len(after), 1)
+        self.assertLess(after[0][1], 110.)
+        self.assertEqual(len(wires), len(old_wires))
+        for (a, ar), (b, br) in zip(wires, old_wires):
+            np.testing.assert_array_equal(a, b)
+            self.assertEqual(ar, br)
+
+
+class CacheErrorTest(unittest.TestCase):
+    """A cache file the server cannot open (PermissionError, PR #861's review at 50.8468, 7.0975): the tile goes on
+    without its power lines, never with half of them; the caller's rows (its decks' furniture) are left as they were."""
+
+    def run_with(self, fail_on=None, ground_fails=False):
+        from test_roads import FRAME
+        good = TowerFootprintTest.place.__get__(TowerFootprintTest())   # (the same one-line infrastructure)
+        props_ok, wires_ok = good()
+        self.assertTrue(props_ok and wires_ok)
+
+        def cell(key, layers, kind):
+            if fail_on in layers:
+                raise PermissionError(13, "Access is denied", "overture/infrastructure/x.npz")
+            return real.cell(key, layers, kind)
+
+        import mapgeom
+        la, lo, _ = FRAME.enu_to_geodetic(np.array([100., 200.]), np.array([100., 100.]), 0.)
+        infra = mapgeom.Features(
+            layer="infrastructure", ids=np.array(["line"]), kind=np.array([mapgeom.LINE], np.uint8),
+            part_off=np.array([0, 1], np.int64), ring_off=np.array([0, 1], np.int64),
+            coord_off=np.array([0, 2], np.int64), lonlat=np.column_stack([lo, la]),
+            attrs={"class": np.array(["power_line"])}, rules={})
+
+        class Real:
+            def cell(self, key, layers, kind):
+                from types import SimpleNamespace
+                return SimpleNamespace(layers={"infrastructure": infra} if "infrastructure" in layers else {"roads": None})
+        real = Real()
+        md = type("Md", (), {"cell": staticmethod(cell)})()
+        def ground(la, lo):
+            if ground_fails:
+                raise PermissionError(13, "Access is denied", "dem/12_2130_1366.npz")
+            return np.zeros(np.shape(la))
+        props, wires = [["deck_rail", 1.0]], [("deck wire", 0.1)]
+        with self.assertLogs("earthd.powerlines", "WARNING") as logged:
+            powerlines.tile_lines(FRAME, 0, 0, md, ground, props, wires)
+        self.assertEqual(props, [["deck_rail", 1.0]])
+        self.assertEqual(wires, [("deck wire", 0.1)])
+        self.assertIn("PermissionError", logged.output[0])
+
+    def test_infrastructure_unreadable(self):
+        self.run_with("infrastructure")
+
+    def test_ground_unreadable_after_lines_were_read(self):
+        """The failure after the lines were read and laid out (the ground under the towers): nothing of it is added."""
+        self.run_with(ground_fails=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
