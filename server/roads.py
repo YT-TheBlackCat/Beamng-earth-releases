@@ -6416,6 +6416,34 @@ def section_lines(ex, feats, i, spec, pts, frame, lon, left_hand, country, ws):
         e for e in lines if e[0].get("kind") == "lane"]
 
 
+NO_MARKINGS_TRUST = os.environ.get("BNE_LANE_MARKINGS_NO", "doubt") == "trust"
+NO_MARKINGS_MIN_W = 6.0             # m: a carriageway of two lanes and more
+NO_MARKINGS_MIN_LEN_M = 80.0        # m: a piece this long is a street's stretch, shorter ones are a junction's pieces
+NO_MARKINGS_MIN_KMH = 50            # km/h: below it (a 30 zone, a calmed street) the map's "no" is believed
+
+
+def doubtful_no_markings(spec, pts, osm):
+    """Is OpenStreetMap's lane_markings=no on this road not to be believed (Germany)? Lasse, 2026-11-26: the 495 m of
+    Renninger Straße (tertiary, 6.5 m, 50 km/h) from the Ezach roundabout toward Ramtel and the motorway had no lines in
+    the game; the street's other pieces, without the tag, have them. The tag is believed on small streets, in 30 zones,
+    on one-way roads and on short pieces (a roundabout's or a square's approach); a long two-way carriageway of
+    primary to tertiary class that is wide enough for two lanes and not slow gets the count's lines instead (data first,
+    the algorithm as the backup where the data looks odd). BNE_LANE_MARKINGS_NO=trust: always believe the tag. Pure."""
+    if NO_MARKINGS_TRUST or str((osm or {}).get("lane_markings", "")).lower() != "no":
+        return False
+    if spec.cls not in ("primary", "secondary", "tertiary", "trunk") or spec.oneway or spec.width < NO_MARKINGS_MIN_W:
+        return False
+    if str((osm or {}).get("junction", "")) in ("roundabout", "circular"):
+        return False
+    if (osm or {}).get("zone:maxspeed") in ("DE:30", "DE:20", "DE:10"):
+        return False
+    if spec.kmh is not None and spec.kmh < NO_MARKINGS_MIN_KMH:
+        return False
+    p = np.asarray(pts, np.float64)
+    length = float(np.hypot(*np.diff(p[:, :2], axis=0).T).sum()) if len(p) > 1 else 0.0
+    return length >= NO_MARKINGS_MIN_LEN_M
+
+
 def extras(spec, pts, lon, left_hand=False, country=None, osm=None, ws=None, shift=None, defer_dashes=False, phase=0.,
            lane_growth=None):
     """The sidewalk / gutter / marking polylines of one road: [(look dict with m / tl / p, width, pts)].
@@ -6514,6 +6542,8 @@ def extras(spec, pts, lon, left_hand=False, country=None, osm=None, ws=None, shi
     # the driving width (a town street's parking lanes and a rural road's edge strips left out: three lanes on every
     # rural Interstate, GitHub #43) and its lanes (OpenStreetMap's count where known)
     drive, lanes = lane_layout(spec)
+    if de and doubtful_no_markings(spec, pts, osm):
+        osm = {k: v for k, v in osm.items() if k != "lane_markings"}   # (the map's "no" is not believed: the count's own)
     # (tapered: the lanes' lines spread with the driving width)
     scale = 1.0 if ws is None else np.maximum(drive + (wv - w), 0.5) / max(drive, 0.5)
     if not spec.oneway and spec.lanes and lanes >= 3 and lanes % 2:

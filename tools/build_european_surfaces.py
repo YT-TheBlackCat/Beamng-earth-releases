@@ -34,14 +34,18 @@ def _additional(out, n):
             tone = np.where((row % 8 < 3)[:, :, None], plain(second, variation + grain * .55 + broad), tone)
         return tone - mortar[:, :, None] * 30.
 
-    save("light_asphalt", plain((112, 110, 105), grain * 1.25 + broad))
+    save("light_asphalt", plain((128, 126, 121), grain * 1.25 + broad))
     save("concrete", plain((156, 152, 144), grain * .75 + broad))
     save("slabs", paving((146, 144, 137), 6, 6, .018))
-    save("pavers", paving((160, 154, 140), 10, 20, .028))
-    save("pavers_mixed", paving((148, 146, 137), 10, 24, .028, second=(157, 123, 115)))
     save("stone", paving((183, 177, 157), 24, 26, .044, irregular=True))
     grit = np.where(rng.random((n, n)) < .18, rng.normal(10., 7., (n, n)), 0.)
     save("gravel", plain((131, 119, 100), grain * 1.3 + grit + broad))
+    # Other tones of the same materials (a street's tone is picked by europewalks.toned, not by the photo's colour)
+    save("concrete_light", plain((174, 172, 166), grain * .75 + broad))
+    save("concrete_warm", plain((162, 151, 134), grain * .75 + broad))
+    save("concrete_dark", plain((130, 129, 126), grain * .75 + broad))
+    save("slabs_light", paving((168, 166, 158), 6, 6, .018))
+    save("slabs_warm", paving((156, 146, 130), 6, 6, .018))
 
 
 FRONTAGE_ASPHALT = {
@@ -84,11 +88,11 @@ def build(out=OUT):
     out=Path(out);out.mkdir(parents=True,exist_ok=True)
     rng=np.random.default_rng(1711029);n=512
     grain=rng.normal(0,6,(n,n));large=rng.normal(0,2,(64,64)).repeat(8,0).repeat(8,1)
-    # sRGB albedo, deliberately below the road painter's neutral (95,95,94).
+    # sRGB albedo: a medium grey (2026-11-25: the old 65 read as near black in game; the road painter's neutral is 95).
     # Do not compensate for sun/shade in the reference photos by baking lighting.
-    asphalt=np.clip(65+grain+large,0,255)
+    asphalt=np.clip(150+grain+large,0,255)
     Image.fromarray(np.stack((asphalt,asphalt-1,asphalt-2),axis=2).astype(np.uint8)).save(out/'footway.color.png')
-    curb=np.clip(55+rng.normal(0,4,(n,n)),0,255)
+    curb=np.clip(152+rng.normal(0,4,(n,n)),0,255)
     curb[:,:3]*=.55;curb[:,-2:]*=.75
     # Same eight trim-sheet bands as the stock profile's UVs, all unpainted.
     for band in range(8):curb[band*64+40:(band+1)*64]*=.83
@@ -104,7 +108,8 @@ def build(out=OUT):
     textures = [('bne_eu_curb','kerb.color.png'), ('bne_eu_asphalt_walk','footway.color.png'),
                 ('bne_eu_tactile','tactile.color.png')]
     textures.extend((f"bne_eu_walk_{name}", f"{name}.color.png")
-                    for name in ("light_asphalt", "concrete", "slabs", "pavers", "pavers_mixed", "stone", "gravel"))
+                    for name in ("light_asphalt", "concrete", "slabs", "stone", "gravel",
+                                 "concrete_light", "concrete_warm", "concrete_dark", "slabs_light", "slabs_warm"))
     for name,texture in textures:
         materials[name]={'name':name,'mapTo':name,'class':'Material','version':1.5,
           'persistentId':str(uuid.uuid5(uuid.NAMESPACE_URL,'beamng-earth:'+name)),

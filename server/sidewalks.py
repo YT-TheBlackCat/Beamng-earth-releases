@@ -39,7 +39,8 @@ CURB_W = 0.15           # m of curb top band
 CROSS_SLOPE = 0.015     # sidewalk cross slope, rising away from the road
 CURB_REPEAT_M = 9.0     # m of curb per texture width (3 joints of 3 m)
 SLAB_REPEAT_M = 45.0    # m of sidewalk per texture width (4096 px, a 205 px strip ~ 2.25 m)
-EU_SURFACES = ("light_asphalt", "concrete", "slabs", "pavers", "pavers_mixed", "stone", "gravel")
+EU_SURFACES = ("light_asphalt", "concrete", "slabs", "stone", "gravel",
+               "concrete_light", "concrete_warm", "concrete_dark", "slabs_light", "slabs_warm")
 MATERIALS = ("curbs", "sidewalk1", "tactile_indicator",  # West Coast USA (art/shapes/roads), loaded by the mod
              "bne_sidewalk_brick", "bne_eu_curb", "bne_eu_asphalt_walk", "bne_eu_tactile",
              "bne_sidewalk_sett",        # (7: a roundabout's paved apron, plan 038: the brick slab's UVs, its own look)
@@ -52,6 +53,9 @@ EU_SLAB = {"asphalt": 5, "brick": 3,
            **{name: i for i, name in enumerate(EU_SURFACES, len(MATERIALS) - len(EU_SURFACES))}}
 BRICK = 3
 BRICK_REPEAT_M = 1.2        # m per repeat of the brick paver texture
+# m per repeat of an EU surface texture (planar UVs): 6 slabs across 3 m are 50 cm paving slabs, the rest 2 m
+SURFACE_REPEAT_M = {"brick": BRICK_REPEAT_M, "slabs": 3., "slabs_light": 3., "slabs_warm": 3.}
+DEFAULT_REPEAT_M = 2.
 
 # Drape (GEHWEGE_DESIGN.md 2.1, E-F2/E-F12): the slab follows the ground behind the curb
 DRAPE_ON = os.environ.get("BNE_WALK_DRAPE", "on") != "off"
@@ -594,7 +598,7 @@ class Builder:
                     if surface is None:
                         UV[slab] = P[slab, :2] / 2.
                     else:
-                        repeat = BRICK_REPEAT_M if surface == "brick" else 2.
+                        repeat = SURFACE_REPEAT_M.get(surface, DEFAULT_REPEAT_M)
                         UV[slab] = (P[slab, :2] + self.origin[:2]) / repeat
                     drawn = P, T, UV, np.take((4, EU_SLAB.get(surface, 5), 6, 3), M)
                 if mat:                      # an island's apron or planting: its slab in its own material (plan 038)

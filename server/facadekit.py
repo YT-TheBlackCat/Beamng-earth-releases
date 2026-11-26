@@ -85,8 +85,13 @@ EPOCHS = {
                 flower=0.0, canopy=0.60, balcony=0.55),
 }
 # plaster by epoch where no colour is mapped: (the colour the epoch's plaster leans to, how far the sheet's tint goes there)
-EPOCH_PLASTER = {"nk": ((0.84, 0.80, 0.68), 0.30), "s70": ((0.80, 0.72, 0.58), 0.30),
-                 "s90": ((0.90, 0.84, 0.76), 0.30), "neu": ((0.92, 0.92, 0.90), 0.50)}
+# (2026-11-25: much lighter and nearer the epoch's colour; the sheet's own tints (olive, brown, grey) made the new districts dull)
+EPOCH_PLASTER = {"nk": ((0.95, 0.92, 0.84), 0.70), "s70": ((0.94, 0.90, 0.80), 0.70),
+                 "s90": ((0.96, 0.94, 0.90), 0.80), "neu": ((0.97, 0.97, 0.95), 0.90)}
+# The kit (single windows, shutters, balconies) dresses only the old houses; a house of 1950 or later keeps the sheet's solid
+# window bands (the base as before the kit, 2026-11-25), in the epoch's light plaster. BNE_FACADE_KIT_NEW=on: the kit on them too.
+KIT_EPOCHS = ("alt", "zw")
+KIT_NEW = os.environ.get("BNE_FACADE_KIT_NEW", "off").lower() in ("on", "1", "true", "yes")
 # What is known of a house without a year (a prior for Leonberg, then how its roof, its place, its size and its aerial
 # roof colour move the odds): epoch -> weight.
 EPOCH_PRIOR = {"alt": 0.06, "zw": 0.08, "nk": 0.22, "s70": 0.24, "s90": 0.20, "neu": 0.20}
@@ -209,6 +214,22 @@ def plaster(rgb, ep):
     return tuple(float(rgb[i]) * (1.0 - k) + to[i] * k for i in range(3))
 
 
+def light_sheet(spec, ep):
+    """A sheet house (the walls with the texture's window bands) in the epoch's plaster instead of the style's tint."""
+    b = _b()
+    if spec.band is None or spec.plain or spec.band == b.BAND_BRICK:
+        return
+    if spec.wall:
+        if str(spec.wall).split("|")[0] not in (b.STONE, b.STONE_RUBBLE):
+            return
+        spec.wall = None                    # (dressed stone on a house of 1950 or later: plaster, like its neighbours)
+        spec.facade = b.custom_look(b.FACADE, plaster((0.95, 0.92, 0.86), ep))
+        return
+    mat, rgb = b.LOOKS.get(spec.facade, (None, None))
+    if mat == b.FACADE:
+        spec.facade = b.custom_look(b.FACADE, plaster(rgb, ep))
+
+
 def decide(spec, attrs, lat, lon, part=False):
     """The kit's plan for a building (a dict kept in spec.kit) or None when it keeps the sheet's windows."""
     if not ON or part or not in_area(lat, lon):
@@ -235,6 +256,10 @@ def decide(spec, attrs, lat, lon, part=False):
     if ep0 is None and in_old and area > OLD_TOWN_BIG_M2 and cls != "apartments":
         ep0 = "alt"                                   # (the castle, the town hall: not a 1970s block)
     ep = ep0 or estimate_epoch(spec, attrs, in_old, area)
+    if ep not in KIT_EPOCHS and not KIT_NEW and not str(spec.wall or "").startswith(b.FACHWERK):
+        if not mapped:
+            light_sheet(spec, ep)
+        return None
     wall = wall_look(spec, None if mapped else ep)
     if wall is None:
         return None

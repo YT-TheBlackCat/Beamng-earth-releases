@@ -16,6 +16,14 @@ LAT, LON = 48.8013, 9.0137          # the old town of Leonberg (Fachwerk circle)
 OUT_LAT, OUT_LON = 52.37, 4.90      # Amsterdam
 
 
+def setUpModule():
+    fk.KIT_NEW = True           # (the kit's own rules are tested on every epoch; NewHousesTest has the default)
+
+
+def tearDownModule():
+    fk.KIT_NEW = False
+
+
 def rect(x, y, w, d):
     return np.array([(x, y), (x + w, y), (x + w, y + d), (x, y + d)], np.float64)
 
@@ -34,6 +42,44 @@ def tri_normals(P, T):
     n = np.cross(P[T[:, 1]] - P[T[:, 0]], P[T[:, 2]] - P[T[:, 0]])
     ln = np.linalg.norm(n, axis=1)
     return n / np.maximum(ln, 1e-12)[:, None], P[T].mean(1), ln
+
+
+class NewHousesTest(unittest.TestCase):
+    """2026-11-25: a house of 1950 or later keeps the sheet's solid window bands, in the epoch's light plaster."""
+
+    def test_new_house_has_no_kit_but_light_plaster(self):
+        ring = rect(0, 0, 11, 9)
+        with mock.patch.object(fk, "KIT_NEW", False):
+            spec, a = house(ring, lat=48.795, lon=9.03, _year=2015)
+        self.assertIsNone(spec.kit)
+        mat, rgb = bld.LOOKS[spec.facade]
+        self.assertEqual(mat, bld.FACADE)
+        self.assertGreater(min(rgb), 0.85)
+
+    def test_old_house_keeps_the_kit(self):
+        with mock.patch.object(fk, "KIT_NEW", False):
+            spec, a = house(rect(0, 0, 11, 9), _year=1890)
+        self.assertIsNotNone(spec.kit)
+
+    def test_switch_brings_the_kit_back(self):
+        with mock.patch.object(fk, "KIT_NEW", True):
+            spec, a = house(rect(0, 0, 11, 9), lat=48.795, lon=9.03, _year=2015)
+        self.assertEqual(spec.kit["ep"], "neu")
+
+    def test_mapped_colour_is_left_alone(self):
+        spec, a = house(rect(0, 0, 11, 9), lat=48.795, lon=9.03, _year=2015, facade_color="#8a6a50")
+        before = spec.facade
+        with mock.patch.object(fk, "KIT_NEW", False):
+            self.assertIsNone(fk.decide(spec, a, 48.795, 9.03))
+        self.assertEqual(spec.facade, before)
+
+    def test_stone_on_a_new_house_becomes_plaster(self):
+        spec, a = house(rect(0, 0, 11, 9), lat=48.795, lon=9.03, _year=2015)
+        spec = bld._spec_copy(spec, wall=f"{bld.STONE}|0", facade=f"{bld.STONE}|0")
+        with mock.patch.object(fk, "KIT_NEW", False):
+            self.assertIsNone(fk.decide(spec, a, 48.795, 9.03))
+        self.assertFalse(spec.wall)
+        self.assertEqual(bld.LOOKS[spec.facade][0], bld.FACADE)
 
 
 class AxesTest(unittest.TestCase):

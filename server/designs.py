@@ -454,7 +454,54 @@ def decide_model(model, ctx, box, signals=None, country=None, priority=None):
         arms = J.arm_tuples()
         out[k] = (arms, controls(arms, k, None, model.ring_fids, signals, country, priority, ctx,
                                  [a.line for a in J.arms]) if d else None)
+    if BYPASS_NODES:
+        demote_bypass_nodes(out, model)
     return out
+
+
+BYPASS_NODES = os.environ.get("BNE_BYPASS_NODES", "on") != "off"
+BYPASS_NEIGHBOUR_M = 60.0       # m: the crossing a slip road's split node belongs to is at most this far along the road
+BYPASS_MAX_LANES = 1            # lanes of a slip road (a one-way road of at most this many lanes)
+
+
+def _has_signal(entry):
+    return entry is not None and entry[1] is not None and any(w == furniture.G_SIGNAL for _a, w, _p in entry[1])
+
+
+def demote_bypass_nodes(out, model):
+    """Slip-road split nodes lose the signal they got from a mapped signal 25 m away (R3-02, 2026-11-26, Lasse: "Spuren
+    fehlen" on Brennerstraße / Römerstraße). A right-turn slip lane with a triangle island splits off the main road
+    30 to 50 m before the crossing: a node of three arms, the straight pair (the main road) and one one-way arm of
+    one lane. The mapped signal of the crossing stands within SIGNAL_NEAR_M of that split node too (furniture.
+    _is_signalled), so the node became signalled, its main arms got a stop line at 3 m, and every lane line stopped
+    there: 40 to 110 m of an arterial without lane lines. The signal belongs to the crossing, a node of four or more
+    arms that is signalled itself and at most BYPASS_NEIGHBOUR_M along the straight pair: the split node gets no
+    control (its arms are `none`: no stop line, no signal group, no AI stop, no line cut). Changes out in place."""
+    import roads
+    flagged = []
+    for k, entry in out.items():
+        if not _has_signal(entry):
+            continue
+        J = model.junctions[k]
+        if len(J.arms) != 3:
+            continue
+        slips = [i for i, a in enumerate(J.arms) if a.spec.oneway and roads.lane_layout(a.spec)[1] <= BYPASS_MAX_LANES]
+        for s in slips:
+            main = [i for i in range(3) if i != s]
+            a, b = J.arms[main[0]], J.arms[main[1]]
+            if a.through != main[1] or b.through != main[0]:
+                continue
+            for arm in (a, b):
+                far = out.get(arm.far) if arm.far is not None else None
+                if far is not None and _has_signal(far) and len(model.junctions[arm.far].arms) >= 4 \
+                        and arm.length <= BYPASS_NEIGHBOUR_M:
+                    flagged.append(k)
+                    break
+            if flagged and flagged[-1] == k:
+                break
+    for k in flagged:                           # (after the loop: a demoted node is no neighbour for the next)
+        arms, _ = out[k]
+        out[k] = (arms, [(a, 0, -1) for a in arms])
 
 
 def _pieces(roads):

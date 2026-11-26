@@ -198,10 +198,24 @@ def choose_user_dir(args):
         where = (r"%LOCALAPPDATA%\BeamNG\BeamNG.drive\current" if IS_WIN else
                  "~/.local/share/BeamNG/BeamNG.drive/current (native) or Steam's "
                  f"compatdata/{STEAM_APP_ID}/pfx/.../AppData/Local/BeamNG/BeamNG.drive/current (Proton)")
-        fail("could not find your BeamNG.drive user folder.\n"
-             "  Start BeamNG.drive once (it creates the folder), then run this again.\n"
-             f"  It is usually {where}.\n"
-             "  In the game: Options > Other > 'User folder' shows where it is; or pass it with\n"
+        say("Could not find your BeamNG.drive user folder automatically.")
+        say(f"  It is usually {where}")
+        say("  In the game: Options > Other > 'User folder' shows it. (Not found at all? Start BeamNG.drive once.)")
+        while not args.yes and sys.stdin.isatty():
+            try:
+                typed = input("Paste the folder here (Enter = cancel): ").strip().strip('"')
+            except EOFError:
+                break
+            if not typed:
+                break
+            d = os.path.abspath(os.path.expanduser(os.path.expandvars(typed)))
+            if os.path.isdir(os.path.join(d, "current")) and not os.path.isdir(os.path.join(d, "mods")):
+                d = os.path.join(d, "current")      # the parent was given: BeamNG.drive\current is the real one
+            if os.path.isdir(d):
+                return d
+            say("  That folder does not exist. Try again.")
+        fail("no BeamNG.drive user folder.\n"
+             "  Start BeamNG.drive once (it creates the folder), then run this again, or pass it with\n"
              '  python install.py --user-dir "<that folder>"')
     if len(found) == 1:
         say(f"BeamNG.drive user folder: {found[0]}")
@@ -550,7 +564,8 @@ def setup_venv(dry_run):
         say(f"(dry run) would {'reuse' if os.path.isfile(py) else 'create'} the virtual environment {VENV} "
             f"and pip-install {os.path.relpath(REQUIREMENTS, ROOT)}")
         return
-    if not os.path.isfile(py):
+    created = not os.path.isfile(py)
+    if created:
         say(f"Python packages: creating a virtual environment in {VENV} ...")
         r = subprocess.run([sys.executable, "-m", "venv", VENV])
         if r.returncode != 0 or not os.path.isfile(py):
@@ -564,14 +579,15 @@ def setup_venv(dry_run):
         cmd.append("--only-binary=duckdb")
     r = subprocess.run(cmd + ["-r", REQUIREMENTS])
     if r.returncode != 0:
+        if created:      # drop the half-made environment: else a retry with another Python would reuse it
+            shutil.rmtree(VENV, ignore_errors=True)
         hint = "  Check your internet connection (and proxy/firewall), then run install.py again."
         if IS_WIN:
             hint = ("  For connection errors, check your internet connection (and proxy/firewall), then retry."
                     "\n  If pip reports 'No matching distribution found' for duckdb, no prebuilt package is available"
                     "\n  for this Python/platform. Try 64-bit Python 3.12 (used by the packaged release builds)."
-                    "\n  Close the server, rename this folder's .venv to an unused backup name, then run:"
-                    "\n    py -3.12 install.py"
-                    "\n  Installing another Python alone does not replace an existing .venv."
+                    "\n  The unfinished .venv was removed. Run run_server.bat again (it picks Python 3.10 to 3.13,"
+                    "\n  or installs 3.12 itself), or: py -3.12 install.py"
                     "\n  Or use the standalone Windows .exe from the GitHub Releases page.")
         fail("pip could not install the packages (see the messages above).\n"
              + hint + "\n"

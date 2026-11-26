@@ -49,6 +49,17 @@ class EuropeanSidewalksTest(unittest.TestCase):
                          walks=walks, park=park, roads_out=carriageways, left_hand=True)
         return walks, park, carriageways
 
+    def test_concrete_comes_in_several_tones_and_every_tone_has_a_slab(self):
+        import sidewalks
+        tones = {europewalks.toned("concrete", "DE", "", f"street {i}", "residential") for i in range(60)}
+        self.assertGreaterEqual(len(tones), 3)
+        self.assertTrue(all(t.startswith("concrete") for t in tones))
+        self.assertEqual(europewalks.toned("stone", "x"), "stone")        # no tones: unchanged
+        self.assertEqual(europewalks.toned("concrete", "a", 1), europewalks.toned("concrete", "a", 1))
+        for tone in set(europewalks.TONES["concrete"]) | set(europewalks.TONES["slabs"]):
+            self.assertIn(tone, sidewalks.EU_SLAB)
+            self.assertIn("bne_eu_walk_" + tone, sidewalks.MATERIALS)
+
     def test_narrow_street_has_grass_between_two_paths_and_no_parking_lanes(self):
         feats = self.features([[(20, 100), (175, 100)]], ["residential"], widths=[(0, 5.)])
         feats.attrs["osm_sidewalk"] = np.array(["both"])
@@ -151,17 +162,17 @@ class EuropeanSidewalksTest(unittest.TestCase):
     def test_divided_street_keeps_its_curbs_and_receives_the_surface_palette(self):
         feats = self.features([[(20, 100), (180, 100)], [(180, 130), (20, 130)]], ["secondary"] * 2)
         feats.attrs["name"] = np.array(["Divided street"] * 2)
-        with mock.patch.object(europewalks, "street_surface", return_value="pavers"):
+        with mock.patch.object(europewalks, "street_surface", return_value="slabs"):
             walks, _, carriageways = self.build(feats)
         self.assertTrue(all(sp.median is not None and sp.street is None for _, sp, _, _ in carriageways))
         ordinary = [w for w in walks if "pts" in w and not w.get("median")]
         self.assertTrue(ordinary)
-        self.assertTrue(all(w["surface"] == "pavers" and w["europe"] for w in ordinary))
+        self.assertTrue(all(w["surface"] == "slabs" and w["europe"] for w in ordinary))
 
     def test_frontage_paves_setbacks_but_avoids_a_drive_and_a_planted_island(self):
         frame = geodesy.EnuFrame(49.02, 7.8)
         walk = {"pts": np.array([[0., 3.75, 0.], [36., 3.75, 0.]]),
-                "side": 1, "w": 1.5, "surface": "pavers", "mapped": True}
+                "side": 1, "w": 1.5, "surface": "slabs", "mapped": True}
         house = np.array([[0., 5.7], [12., 5.7], [12., 8.], [0., 8.]])
         set_back = house + [24., 4.]
         # The little flowerbed is fully inside one connector quad.
@@ -181,7 +192,7 @@ class EuropeanSidewalksTest(unittest.TestCase):
                            [4.5, 4.8], [19.95, 5.025], [5., 4.2], [18., 6.5]])
         hits = [(c["m"], polygon.contains_points(np.asarray(c["poly"]), points)) for c in chunks]
         np.testing.assert_array_equal(np.sum([mask for _, mask in hits], axis=0), [1, 1, 1, 1, 0, 0, 0, 0])
-        self.assertEqual({m for m, mask in hits if mask.any()}, {"bne_eu_walk_pavers"})
+        self.assertEqual({m for m, mask in hits if mask.any()}, {"bne_eu_walk_slabs"})
 
         service = ("a", roads.Spec(2.5, "paved", True, "service"), np.array([[22., 0., 0.], [22., 7., 0.]]), 7.8)
         with mock.patch.object(roads, "ROADS_IN_GROUND", True):
@@ -195,13 +206,13 @@ class EuropeanSidewalksTest(unittest.TestCase):
 
 
 class GermanPaletteTest(unittest.TestCase):
-    ALLOWED = {"asphalt", "light_asphalt", "concrete", "slabs", "pavers", "stone", "brick", "gravel"}
+    ALLOWED = {"asphalt", "light_asphalt", "concrete", "slabs", "stone", "brick", "gravel"}
 
     def test_germany_has_its_own_palette_from_the_known_surface_tokens(self):
         palette = europewalks.PALETTES["DE"]
         self.assertTrue(set(palette) <= self.ALLOWED)
         self.assertIn("asphalt", palette)
-        self.assertIn("pavers", palette)
+        self.assertIn("slabs", palette)
 
     def test_street_surface_draws_german_streets_from_the_german_palette(self):
         surface_name = europewalks.street_surface("DE", "Musterstraße", "residential", 8.99, 48.8)

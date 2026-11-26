@@ -9,7 +9,9 @@ Du bekommst immer die **neueste stabile, getestete Version** aus dem öffentlich
 
 - BeamNG.drive (Windows), einmal gestartet.
 - [Git für Windows](https://git-scm.com/download/win) (Standardeinstellungen reichen).
-- [Python 3.10 oder neuer](https://www.python.org/downloads/) (beim Installieren **"Add python.exe to PATH"** ankreuzen).
+- Python: **musst du nicht selbst installieren.** `run_server.bat` sucht Python 3.10 bis 3.13 und installiert sonst
+  Python 3.12 selbst (ohne Admin-Rechte). Wichtig: Python 3.14 und neuer geht nicht (kein DuckDB-Paket), die Datei nimmt
+  dann automatisch 3.12.
 - Internet, Platz für ca. 1 GB (Programm 400 MB, dazu der Zwischenspeicher mit Karten- und Höhendaten).
 - Ein Rechner, auf dem BeamNG.drive und der Server gleichzeitig laufen (am besten dieselbe Maschine).
 
@@ -46,6 +48,18 @@ werden dabei vom Start gleich mit aktualisiert.
 - Hast du selbst Dateien im Ordner geändert und das Update kommt dagegen nicht an: es steht im Fenster, die Version
   startet trotzdem. Dann entweder die Änderung rückgängig machen (`git checkout -- <Datei>`) oder den Ordner neu klonen.
 - Update einmal auslassen: in der Konsole `set BNE_NO_UPDATE=1`, dann `run_server.bat`.
+
+## Probleme
+
+- **"Python wurde nicht gefunden ... Microsoft Store"**: kommt von den App-Ausführungsaliasen und ist harmlos, die Datei
+  installiert Python 3.12 selbst. Klappt das nicht: Python 3.12 von python.org installieren (Haken bei "Add python.exe to
+  PATH") und `run_server.bat` erneut starten.
+- **"No matching distribution found for duckdb"**: eine zu neue Python-Version wurde benutzt. Das angefangene `.venv`
+  wird jetzt automatisch gelöscht; `run_server.bat` erneut starten (es nimmt 3.12). Ältere Ordner einmal von Hand:
+  `.venv` löschen.
+- **BeamNG-Ordner nicht gefunden**: das Installationsprogramm fragt dann nach dem Pfad. Im Spiel unter Optionen, Sonstiges,
+  "Benutzerordner" steht er (meist `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current`), hier einfügen.
+- Als ZIP heruntergeladen (Ordner `...-main`)? Läuft, aktualisiert sich aber nicht. Besser per `git clone` (siehe oben).
 
 ## Rasen und Gärten (optional)
 

@@ -8,7 +8,7 @@ from typing import NamedTuple
 import numpy as np
 import dmath
 
-VERSION = "european-street-edges-v5"
+VERSION = "european-street-edges-v6"
 STREETS = {"primary", "secondary", "tertiary", "unclassified", "residential", "living_street"}
 VILLAGE_WIDTH = dict(primary=6.1, secondary=5.8, tertiary=5.2, unclassified=4.9,
                      residential=4.6, living_street=4.0)
@@ -19,28 +19,42 @@ FLUSH_EDGE_HEIGHT = .02
 # Defaults for unknown surfaces, weighted by repetition. Reference photos
 # inform the palette; these weights are scenery choices, not survey statistics.
 PALETTES = {
-    "DE": ("concrete", "concrete", "slabs", "pavers", "pavers", "asphalt", "light_asphalt"),
-    "ES": ("slabs", "pavers", "pavers", "concrete", "light_asphalt"),
+    "DE": ("concrete", "concrete", "slabs", "slabs", "slabs", "asphalt", "light_asphalt"),
+    "ES": ("slabs", "slabs", "slabs", "concrete", "light_asphalt"),
     "FR": ("asphalt", "asphalt", "asphalt", "light_asphalt", "concrete", "slabs"),
     "GB": ("asphalt", "asphalt", "asphalt", "light_asphalt", "slabs"),
     "IE": ("asphalt", "asphalt", "concrete", "light_asphalt"),
-    "IT": ("asphalt", "light_asphalt", "slabs", "pavers", "stone"),
-    "NL": ("slabs", "slabs", "slabs", "brick", "pavers"),
-    "PL": ("pavers", "slabs", "pavers_mixed", "pavers_mixed"),
-    "PT": ("stone", "stone", "slabs", "pavers", "light_asphalt"),
-    "RO": ("pavers", "pavers", "pavers", "concrete", "light_asphalt", "asphalt"),
+    "IT": ("asphalt", "light_asphalt", "slabs", "slabs", "stone"),
+    "NL": ("slabs", "slabs", "slabs", "brick", "slabs"),
+    "PL": ("slabs", "slabs", "slabs", "slabs"),
+    "PT": ("stone", "stone", "slabs", "slabs", "light_asphalt"),
+    "RO": ("slabs", "slabs", "slabs", "concrete", "light_asphalt", "asphalt"),
 }
 # Old towns whose streets are paved in natural stone (Natursteinpflaster) whatever the country palette says:
 # (name, lat, lon, radius m). Leonberg's Altstadt is the Marktplatz hill inside the old town wall.
 OLD_TOWNS = (("Leonberg Altstadt", 48.8010, 9.0150, 280.),)
 MAPPED_SURFACE = {
     "asphalt": "asphalt", "chipseal": "light_asphalt", "concrete": "concrete",
-    "concrete:plates": "slabs", "paving_stones": "pavers", "sett": "stone",
-    "interlocking_pavers": "pavers", "interlocking_stones": "pavers",
+    "concrete:plates": "slabs", "paving_stones": "slabs", "sett": "stone",
+    "interlocking_pavers": "slabs", "interlocking_stones": "slabs",
     "cobblestone": "stone", "unhewn_cobblestone": "stone", "bricks": "brick",
     "compacted": "gravel", "fine_gravel": "gravel", "gravel": "gravel",
     "dirt": "gravel", "ground": "gravel", "unpaved": "gravel",
 }
+
+
+# Other tones of one material (concrete is not one grey). The tone is a scenery choice made per street, never from the
+# photo's colour: the kind of surface comes from the map tag, the country's palette or the old town.
+TONES = {"concrete": ("concrete", "concrete", "concrete_light", "concrete_warm", "concrete_dark"),
+         "slabs": ("slabs", "slabs", "slabs_light", "slabs_warm")}
+
+
+def toned(surface, *token):
+    """surface in one of its tones, stable for the same token (a street's name and place)."""
+    import furniture
+
+    tones = TONES.get(surface)
+    return tones[int(furniture._h01("walk-tone", *token) * len(tones))] if tones else surface
 
 
 class Walk(NamedTuple):
@@ -174,7 +188,7 @@ def village_walks(spec, country, sidewalk, frontage=(0., 0.), infer=False, build
     if country == "DE":
         walk = Walk(1.6, 0., .13, "concrete")
         return tuple(walk if side in sides else None for side in (1, -1))
-    walk = Walk(1.12, .9, LOW_EDGE_HEIGHT, "pavers" if country in {"RO", "PL", "NL"} else "concrete")
+    walk = Walk(1.12, .9, LOW_EDGE_HEIGHT, "slabs" if country in {"RO", "PL", "NL"} else "concrete")
     return tuple(walk if side in sides else None for side in (1, -1))
 
 
@@ -197,8 +211,8 @@ def street_surface(country, name, cls, lon, lat, locality=None):
     if locality is None:
         locality, _ = _locality(country, lon, lat)
     token = (country, locality, name or (round(lon, 2), round(lat, 2)), cls)
-    palette = PALETTES.get(country, ("asphalt", "asphalt", "light_asphalt", "concrete", "pavers"))
-    return palette[int(furniture._h01("walk-surface", *token) * len(palette))]
+    palette = PALETTES.get(country, ("asphalt", "asphalt", "light_asphalt", "concrete", "slabs"))
+    return toned(palette[int(furniture._h01("walk-surface", *token) * len(palette))], *token)
 
 
 def plan(spec, country, lon, lat, name, sidewalk, mapped_width, frontage, infer):
@@ -226,6 +240,8 @@ def plan(spec, country, lon, lat, name, sidewalk, mapped_width, frontage, infer)
 
     if village:
         left, right = village_walks(spec, country, raw, frontage, infer)
+        token = (country, locality, name or (round(lon, 2), round(lat, 2)), spec.cls)
+        left, right = (w._replace(surface=toned(w.surface, *token)) if w else None for w in (left, right))
     else:
         surface = street_surface(country, name, spec.cls, lon, lat, locality)
         detached = (country in {"GB", "IE"} and spec.cls == "residential"
@@ -274,7 +290,8 @@ def mapped_walk(feats, i):
     width = float(width) if width is not None and .55 <= float(width) <= 12. else 1.4
     raw = str(roads._surface_value(feats, i) or "").strip().lower()
     surface = MAPPED_SURFACE.get(raw, MAPPED_SURFACE.get(roads.surface_token(raw), "light_asphalt"))
-    return Walk(width, .2, .035, surface)
+    return Walk(width, .2, .035, toned(surface, round(float(feats.lonlat[(a + b) // 2][0]), 3),
+                                       round(float(feats.lonlat[(a + b) // 2][1]), 3)))
 
 
 def mapped_walks(frame, cells, near):

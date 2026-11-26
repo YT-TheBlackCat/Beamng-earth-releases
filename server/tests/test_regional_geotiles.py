@@ -93,7 +93,7 @@ class RegionalGeoTest(unittest.TestCase):
         out.mkdir()
         paths = [
             {"pts": np.array([[-25., -10., 0.], [25., -10., 0.]]), "w": 1.1, "height": .045,
-             "side": -1, "caps": (True, True), "europe": True, "surface": "pavers"},
+             "side": -1, "caps": (True, True), "europe": True, "surface": "concrete"},
             {"pts": np.array([[-25., 10., 0.], [25., 10., 0.]]), "w": 1.4, "height": .13,
              "side": 1, "caps": (True, True), "europe": True, "surface": "slabs"},
         ]
@@ -114,12 +114,12 @@ class RegionalGeoTest(unittest.TestCase):
             mat = shape["materials"][int(flags) & 0x0fffffff]["name"]
             vertices = mesh["verts"][mesh["indices"][start:start + count]]
             z[mat] = float(vertices[:, 2].max())
-        self.assertIn("bne_eu_walk_pavers", z)
+        self.assertIn("bne_eu_walk_concrete", z)
         self.assertIn("bne_eu_walk_slabs", z)
         self.assertNotIn("bne_eu_asphalt_walk", z)
         # slabs: height .13 plus the cross slope rising away from the road over the 1.4 m width (sidewalks.DRAPE_CROSS_SLOPE),
-        # pavers (height .045) stay flat: the slab's highest point is .13 + 1.4 * 2 % = .158, not the bare record height.
-        self.assertAlmostEqual(z["bne_eu_walk_slabs"] - z["bne_eu_walk_pavers"],
+        # concrete (height .045) stay flat: the slab's highest point is .13 + 1.4 * 2 % = .158, not the bare record height.
+        self.assertAlmostEqual(z["bne_eu_walk_slabs"] - z["bne_eu_walk_concrete"],
                                .13 + 1.4 * sidewalks.DRAPE_CROSS_SLOPE - .045, delta=.005)
 
     def test_prebuilt_content_is_reused_and_off_has_separate_cache(self):
@@ -206,7 +206,7 @@ class NativePaletteTest(unittest.TestCase):
 
         points = np.array([[0., 3., ground(0., 2.4)], [12., 3., ground(12., 2.4)]])
         walk = {"pts": points, "w": 1.2, "side": 1, "caps": (True, False),
-                "height": .045, "europe": True, "surface": "pavers"}
+                "height": .045, "europe": True, "surface": "concrete"}
         b = sidewalks.Builder((0., 0., 0.), collision=True, ground=ground)
         b.add_walk(walk, 2.5)
         for P, T, *_ in (b.arrays(), b.col.arrays()):

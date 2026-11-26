@@ -40,8 +40,9 @@ VERDICT = re.compile(r"\b(ok|FAIL|ERROR|skipped.*|expected failure|unexpected su
 
 
 class Runner:
-    def __init__(self, mods, par, timeout, logs, hist):
+    def __init__(self, mods, par, timeout, logs, hist, quiet=False):
         self.mods, self.par, self.timeout, self.logs, self.hist = mods, par, timeout, logs, hist
+        self.quiet = quiet      # only failing modules and the summary, short log tails (keeps agent context small)
         self.lock = threading.Lock()
         self.state = {}         # module -> {start, current, t_test, n, bad, proc, killed, done}
         self.t0 = time.time()
@@ -101,7 +102,8 @@ class Runner:
                 timer.cancel()
         dt = time.time() - st["start"]
         res = "HANG" if st["killed"] else "OK" if p.returncode == 0 else "FAIL"
-        self.say(f"== {m:26} {res:6} {dt:6.1f}s  {st['n']} tests"
+        if not (self.quiet and res == "OK"):
+            self.say(f"== {m:26} {res:6} {dt:6.1f}s  {st['n']} tests"
                  + (f"  bad: {', '.join(st['bad'])}" if st["bad"] else ""))
         return m, res, dt
 
@@ -117,7 +119,7 @@ class Runner:
             st["n"] += 1
             if verdict in ("FAIL", "ERROR"):
                 st["bad"].append(st["current"])
-            if verdict != "ok" or dt > SLOW_S:
+            if (verdict != "ok" or dt > SLOW_S) and not self.quiet:
                 self.say(f"{m:29} {verdict[:7]:7} {dt:6.1f}s  {st['current']}")
             st["current"], st["t_test"] = None, time.time()
 
@@ -160,7 +162,8 @@ class Runner:
         self.say(f"{len(self.mods)} modules, {self.par} at a time, timeout {self.timeout} s, "
                  f"ETA ~{self.eta() / 60:.1f} min, logs in {self.logs}")
         stop = threading.Event()
-        threading.Thread(target=self.ticker, args=(stop,), daemon=True).start()
+        if not self.quiet:
+            threading.Thread(target=self.ticker, args=(stop,), daemon=True).start()
         res = []
         ex = cf.ThreadPoolExecutor(self.par)
         try:
@@ -187,7 +190,7 @@ class Runner:
         for m, r in bad:
             try:
                 with open(os.path.join(self.logs, m + '.log'), encoding='utf-8', errors='replace') as fh:
-                    tail = fh.readlines()[-100:]
+                    tail = fh.readlines()[-(30 if self.quiet else 100):]
             except OSError as e:
                 self.say(f"--- {m} ({r}): no log ({e}) ---")
                 continue
@@ -203,6 +206,8 @@ def main():
     ap.add_argument("--par", type=int, default=6)
     ap.add_argument("--timeout", type=int, default=1500)
     ap.add_argument("--logs", default=os.path.join(BUILD, "test-logs"))
+    ap.add_argument("--quiet", action="store_true",
+                    help="print only failing modules, the summary and 30-line log tails (full logs stay in --logs)")
     a = ap.parse_args()
     mods = [m[:-3] if m.endswith(".py") else m for m in a.modules] or \
         sorted(os.path.basename(p)[:-3] for p in glob.glob(os.path.join(TESTS, "test_*.py")))
@@ -213,7 +218,7 @@ def main():
     except (OSError, ValueError):
         hist = {}
     mods.sort(key=lambda m: -hist.get(m, {}).get("secs", DEFAULT_S))     # longest first: none ends the run alone
-    return Runner(mods, max(1, a.par), a.timeout, os.path.abspath(a.logs), hist).all()
+    return Runner(mods, max(1, a.par), a.timeout, os.path.abspath(a.logs), hist, a.quiet).all()
 
 
 if __name__ == "__main__":

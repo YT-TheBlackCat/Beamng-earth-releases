@@ -299,6 +299,21 @@
    "format": "BC7_SRGB",
    "role": "color"
   },
+  "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/concrete_dark.color.dds": {
+   "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/concrete_dark.color.webp",
+   "format": "BC7_SRGB",
+   "role": "color"
+  },
+  "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/concrete_light.color.dds": {
+   "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/concrete_light.color.webp",
+   "format": "BC7_SRGB",
+   "role": "color"
+  },
+  "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/concrete_warm.color.dds": {
+   "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/concrete_warm.color.webp",
+   "format": "BC7_SRGB",
+   "role": "color"
+  },
   "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/footway.color.dds": {
    "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/footway.color.webp",
    "format": "BC7_SRGB",
@@ -319,18 +334,18 @@
    "format": "BC7_SRGB",
    "role": "color"
   },
-  "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/pavers.color.dds": {
-   "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/pavers.color.webp",
-   "format": "BC7_SRGB",
-   "role": "color"
-  },
-  "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/pavers_mixed.color.dds": {
-   "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/pavers_mixed.color.webp",
-   "format": "BC7_SRGB",
-   "role": "color"
-  },
   "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/slabs.color.dds": {
    "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/slabs.color.webp",
+   "format": "BC7_SRGB",
+   "role": "color"
+  },
+  "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/slabs_light.color.dds": {
+   "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/slabs_light.color.webp",
+   "format": "BC7_SRGB",
+   "role": "color"
+  },
+  "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/slabs_warm.color.dds": {
+   "source": "levels/beamng_earth/art/shapes/beamngEarth/eu_surfaces/slabs_warm.color.webp",
    "format": "BC7_SRGB",
    "role": "color"
   },

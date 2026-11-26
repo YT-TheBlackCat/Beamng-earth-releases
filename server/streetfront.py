@@ -22,7 +22,7 @@ GREEN = {"garden", "grass", "flowerbed", "grassland", "meadow", "park", "village
 COMMERCIAL = {"retail", "commercial", "shopping_centre", "supermarket", "office"}
 PAVED_AREAS = {"footway", "pedestrian", "cycleway", "living_street", "service"}
 PHOTO_WIDTH_M = 5.5
-PAVER_SURFACES = {"pavers", "pavers_mixed", "slabs", "stone", "brick"}
+PAVER_SURFACES = {"slabs", "stone", "brick"}
 
 
 class PhotoPaving:
@@ -244,7 +244,7 @@ def _paving(poly, surface):
         material, repeat = roadmesh.FRONTAGE_ASPHALT, roadmesh.FRONTAGE_REPEAT_M
     else:
         material = sidewalks.MATERIALS[sidewalks.EU_SLAB[surface]]
-        repeat = sidewalks.BRICK_REPEAT_M if surface == "brick" else 2.
+        repeat = sidewalks.SURFACE_REPEAT_M.get(surface, sidewalks.DEFAULT_REPEAT_M)
     return {"m": material, "w": 0., "tl": repeat, "u_m": repeat,
             "p": 17, "layer": "frontage", "poly": poly.tolist(), "n": [], "frontage": True}
 
@@ -528,7 +528,7 @@ def chunks(frame, walks, buildings, lots, carriageways, drives, box, *, shops=()
     coverage = _coverage(box, walks, buildings, [*green, *reserved], bands)
     result = list(access)
     for rings, raw in explicit:
-        surface = europewalks.MAPPED_SURFACE.get(raw, "pavers")
+        surface = europewalks.MAPPED_SURFACE.get(raw, "slabs")
         result.extend(_paving(part, surface) for part in coverage.claim(rings[0]))
     # Mapped paving is continuous with its sidewalk. Inferred sidewalks and
     # street edges share one finish for the rest of the frontage.

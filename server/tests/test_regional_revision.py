@@ -126,9 +126,11 @@ class EuropeTest(unittest.TestCase):
                 pixels=np.asarray(im.convert('RGB'),float)
             means[name]=pixels.mean()
             self.assertGreater(pixels.std(),1.,'surface grain should survive')
-        self.assertLess(means['bne_eu_asphalt_walk'],85.,'asphalt should be darker than the neutral road albedo')
-        self.assertLess(means['bne_eu_curb'],means['bne_eu_asphalt_walk'])
-        self.assertGreater(means['bne_eu_tactile'],means['bne_eu_asphalt_walk']+70.)
+        # (2026-11-25: a footway at 65 read as near black in game; a medium grey, still below the lighter paving)
+        self.assertTrue(130.<means['bne_eu_asphalt_walk']<175.,'an asphalt footway is a medium grey, not black')
+        self.assertTrue(120.<means['bne_eu_curb']<means['bne_eu_asphalt_walk'],'a kerb is its own colour, a little darker than the footway')
+        self.assertGreater(means['bne_eu_curb'],means['bne_eu_asphalt_walk']-20.)
+        self.assertGreater(means['bne_eu_tactile'],means['bne_eu_asphalt_walk']+40.)
 
     def test_surface_generator_reproduces_decoded_assets(self):
         with tempfile.TemporaryDirectory() as temp:
